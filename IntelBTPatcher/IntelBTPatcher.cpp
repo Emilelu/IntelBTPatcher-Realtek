@@ -108,14 +108,14 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 DBGLOG(DRV_NAME, "routed %s", findQueueRequestRequest.symbol);
             } else {
-                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", findQueueRequestRequest.symbol, patcher.getError() "\n");
+                IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", findQueueRequestRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
             
         }
     } else {
         if (IntelBTPatcher_IOUsbHostInfo.loadIndex == index) {
-            IOLog("IntelBTPatcher: " "%s", IntelBTPatcher_IOUsbHostInfo.id "\n");
+            IOLog("IntelBTPatcher: %s\n", IntelBTPatcher_IOUsbHostInfo.id);
             
             KernelPatcher::RouteRequest hostDeviceRequest {
             "__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
@@ -124,9 +124,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &hostDeviceRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                IOLog("IntelBTPatcher: " "routed %s", hostDeviceRequest.symbol "\n");
+                IOLog("IntelBTPatcher: routed %s\n", hostDeviceRequest.symbol);
             } else {
-                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError() "\n");
+                IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", hostDeviceRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
 
@@ -137,9 +137,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &asyncIORequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                IOLog("IntelBTPatcher: " "routed %s", asyncIORequest.symbol "\n");
+                IOLog("IntelBTPatcher: routed %s\n", asyncIORequest.symbol);
             } else {
-                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", asyncIORequest.symbol, patcher.getError() "\n");
+                IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", asyncIORequest.symbol, patcher.getError());
                 patcher.clearError();
             }
 
@@ -151,9 +151,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &initPipeConfigRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                IOLog("IntelBTPatcher: " "routed %s", initPipeConfigRequest.symbol "\n");
+                IOLog("IntelBTPatcher: routed %s\n", initPipeConfigRequest.symbol);
             } else {
-                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", initPipeConfigRequest.symbol, patcher.getError() "\n");
+                IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", initPipeConfigRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
 
@@ -164,9 +164,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &initPipeRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                IOLog("IntelBTPatcher: " "routed %s", initPipeRequest.symbol "\n");
+                IOLog("IntelBTPatcher: routed %s\n", initPipeRequest.symbol);
             } else {
-                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", initPipeRequest.symbol, patcher.getError() "\n");
+                IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", initPipeRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
         }
@@ -233,11 +233,11 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 writeHCIDescriptor->complete(kIODirectionInOut);
                 const char *randAddressDump = _hexDumpHCIData((uint8_t *)randomAddressHci, 9);
                 if (randAddressDump) {
-                    IOLog("IntelBTPatcher: " "[PATCH] Sending Random Address HCI %d %s", ret, randAddressDump "\n");
+                    IOLog("IntelBTPatcher: [PATCH] Sending Random Address HCI %d %s\n", ret, randAddressDump);
                     IOFree((void *)randAddressDump, 9 * 3 + 1);
                 }
                 _randomAddressInit = true;
-                IOLog("IntelBTPatcher: " "[PATCH] Resend LE SCAN PARAM HCI %d", ret "\n");
+                IOLog("IntelBTPatcher: [PATCH] Resend LE SCAN PARAM HCI %d\n", ret);
             }
         } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
             // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
@@ -350,12 +350,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
     if (deviceDescriptor && (deviceDescriptor->idVendor == VENDOR_USB_INTEL || deviceDescriptor->idVendor == VENDOR_USB_REALTEK)) {
         bool isRealtek = (deviceDescriptor->idVendor == VENDOR_USB_REALTEK);
         if (isRealtek)
-            IOLog("IntelBTPatcher: " "[Realtek] vendor 0x0BDA matched, idProduct=0x%04x (%s)", deviceDescriptor->idProduct, device->getName() "\n");
+            IOLog("IntelBTPatcher: [Realtek] vendor 0x0BDA matched, idProduct=0x%04x (%s)\n", deviceDescriptor->idProduct, device->getName());
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
             if (isRealtek)
-                IOLog("IntelBTPatcher: " "[Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed", device->getName() "\n");
+                IOLog("IntelBTPatcher: [Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed\n", device->getName());
         }
     }
 }
