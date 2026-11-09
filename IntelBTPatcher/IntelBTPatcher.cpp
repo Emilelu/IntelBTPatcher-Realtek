@@ -454,15 +454,27 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
             g_leMetaStage == 0) {
             g_leMetaStage = 1;
             remoteReadSCount = 0;
-            if (dataBuffer->getLength() >= origLen + fakeLen) {
+            // #514 needs BOTH events: LE PHY Update Complete first (clears PHY gate),
+            // then LE Data Length Change (clears LE_READY_WAIT_FOR_LENGTH).
+            const uint32_t phyLen = 8;
+            const uint32_t totalLen = phyLen + fakeLen;
+            if (dataBuffer->getLength() >= origLen + totalLen) {
                 uint16_t handle = (uint16_t)hdr->data[2] | ((uint16_t)hdr->data[3] << 8);
-                uint8_t fakeEvent[sizeof(fakeDataLengthChangeEvent)];
-                memcpy(fakeEvent, fakeDataLengthChangeEvent, fakeLen);
-                fakeEvent[3] = hdr->data[2];
-                fakeEvent[4] = hdr->data[3];
-                memcpy((uint8_t *)buffer + origLen, fakeEvent, fakeLen);
-                dataBuffer->writeBytes(0, buffer, origLen + fakeLen);
-                bytesTransferred = origLen + fakeLen;
+                uint8_t *dst = (uint8_t *)buffer + origLen;
+
+                // LE PHY Update Complete: 3E 06 0C 00 <h_lo> <h_hi> 02 02
+                dst[0] = 0x3E; dst[1] = 0x06; dst[2] = 0x0C; dst[3] = 0x00;
+                dst[4] = hdr->data[2]; dst[5] = hdr->data[3];
+                dst[6] = 0x02; dst[7] = 0x02;
+
+                // LE Data Length Change: 3E 0B 07 <h_lo> <h_hi> 1B 00 48 01 1B 00 48 01
+                dst[8] = 0x3E; dst[9] = 0x0B; dst[10] = 0x07;
+                dst[11] = hdr->data[2]; dst[12] = hdr->data[3];
+                dst[13] = 0x1B; dst[14] = 0x00; dst[15] = 0x48; dst[16] = 0x01;
+                dst[17] = 0x1B; dst[18] = 0x00; dst[19] = 0x48; dst[20] = 0x01;
+
+                dataBuffer->writeBytes(0, buffer, origLen + totalLen);
+                bytesTransferred = origLen + totalLen;
                 g_injected++;
                 publishDeviceInt("IBTPInjected", g_injected);
                 char hb[16];
