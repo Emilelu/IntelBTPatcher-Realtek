@@ -15,6 +15,9 @@ static CIntelBTPatcher ibtPatcher;
 static CIntelBTPatcher *callbackIBTPatcher = nullptr;
 static long g_routeDevReqErr = -999;
 static long g_routeAsyncIOErr = -999;
+static long g_routeIOSourceIOCompletionErr = -999;
+static long g_routeIOSourceIORjjErr = -999;
+static long g_routeIOSourceIOBundledErr = -999;
 static long g_routeInitCfgErr = -999;
 static long g_routeInitPipeErr = -999;
 static int g_devReqTotal = 0;
@@ -22,6 +25,7 @@ static int g_asyncAll = 0;
 static int g_leMetaStage = 0;
 static int g_edlCleared = 0;
 static int g_injected = 0;
+static int g_iosSourceHits = 0;
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
@@ -81,6 +85,7 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 };
 
 void *CIntelBTPatcher::_hookPipeInstance = nullptr;
+bool CIntelBTPatcher::_iosSourceCompletionRouted = false;
 bool CIntelBTPatcher::_randomAddressInit = false;
 
 bool CIntelBTPatcher::init()
@@ -164,6 +169,53 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 patcher.clearError();
             }
 
+            // macOS Tahoe: IOUSBHostPipe::io may tail-jump into one of the three
+            // IOUSBHostIOSource::io overloads, so hook all of them.
+            if (getKernelVersion() >= KernelVersion::Tahoe) {
+                KernelPatcher::RouteRequest iosourceIOCompletionRequest {
+                "__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
+                    newIOSourceIOCompletion,
+                    oldIOSourceIOCompletion
+                };
+                patcher.routeMultiple(index, &iosourceIOCompletionRequest, 1, address, size);
+                g_routeIOSourceIOCompletionErr = (long)patcher.getError();
+                if (patcher.getError() == KernelPatcher::Error::NoError) {
+                    IOLog("IntelBTPatcher: routed %s\n", iosourceIOCompletionRequest.symbol);
+                    _iosSourceCompletionRouted = true;
+                } else {
+                    IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", iosourceIOCompletionRequest.symbol, patcher.getError());
+                    patcher.clearError();
+                }
+
+                KernelPatcher::RouteRequest iosourceIORjjRequest {
+                "__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjRjj",
+                    newIOSourceIORjj,
+                    oldIOSourceIORjj
+                };
+                patcher.routeMultiple(index, &iosourceIORjjRequest, 1, address, size);
+                g_routeIOSourceIORjjErr = (long)patcher.getError();
+                if (patcher.getError() == KernelPatcher::Error::NoError) {
+                    IOLog("IntelBTPatcher: routed %s\n", iosourceIORjjRequest.symbol);
+                } else {
+                    IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", iosourceIORjjRequest.symbol, patcher.getError());
+                    patcher.clearError();
+                }
+
+                KernelPatcher::RouteRequest iosourceIOBundledRequest {
+                "__ZN17IOUSBHostIOSource2ioEP18IOMemoryDescriptorjP26IOUSBHostBundledCompletionj",
+                    newIOSourceIOBundled,
+                    oldIOSourceIOBundled
+                };
+                patcher.routeMultiple(index, &iosourceIOBundledRequest, 1, address, size);
+                g_routeIOSourceIOBundledErr = (long)patcher.getError();
+                if (patcher.getError() == KernelPatcher::Error::NoError) {
+                    IOLog("IntelBTPatcher: routed %s\n", iosourceIOBundledRequest.symbol);
+                } else {
+                    IOLog("IntelBTPatcher: failed to resolve %s, error = %d\n", iosourceIOBundledRequest.symbol, patcher.getError());
+                    patcher.clearError();
+                }
+            }
+
             // macOS 26.5+: third parameter became ConfigurationDescriptor (was SuperSpeedEndpointCompanionDescriptor)
             KernelPatcher::RouteRequest initPipeConfigRequest {
             "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_23ConfigurationDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
@@ -228,6 +280,31 @@ int interceptedAsyncCount = 0;
 static IOUSBHostDevice *g_btDevice = nullptr;
 static int g_lrfSeen = 0;
 static int g_asyncSeen = 0;
+
+static void publishDeviceInt(const char *key, int value)
+{
+    if (g_btDevice == nullptr)
+        return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    OSData *data = OSData::withBytes(buf, strlen(buf));
+    if (data != nullptr) {
+        g_btDevice->setProperty(key, data);
+        data->release();
+    }
+}
+
+static void publishDeviceString(const char *key, const char *value)
+{
+    if (g_btDevice == nullptr || value == nullptr)
+        return;
+    OSData *data = OSData::withBytes(value, strlen(value));
+    if (data != nullptr) {
+        g_btDevice->setProperty(key, data);
+        data->release();
+    }
+}
+
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
     // Publish a marker on the real IOUSBHostDevice so we can verify from userland
@@ -291,14 +368,12 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 snprintf(b, sizeof(b), "%d", g_lrfSeen);
                 g_btDevice->setProperty("IBTPReqLRF", OSData::withBytes(b, strlen(b)));
             }
-            // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
-            // (1st dup -> fake PHY Update Complete, 2nd dup -> fake LE Data Length Change).
-            // Realtek only returns ONE real LE Read Remote Features Complete event.
-            // Reset (not +=) so the counter cannot grow unbounded and block the rewrite.
-            remoteReadSCount = 2;
+            // #514 single-event injection: arm the completion rewrite for the
+            // first real LE Read Remote Features Complete (LE Meta 0x04). The
+            // fake LE Data Length Change is appended to that same transfer, so
+            // do NOT resend 0x2016 (no duplicate 0x04 event is required).
+            remoteReadSCount = 1;
             g_leMetaStage = 0;
-            FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
-            FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
         }
     } else {
         hdr = (HciCommandHdr *)data;
@@ -306,8 +381,11 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     }
     if (hdr) {
         // HCI reset, we need to send Random address again
-        if (hdr->opcode == HCI_OP_RESET)
+        if (hdr->opcode == HCI_OP_RESET) {
             _randomAddressInit = false;
+            g_leMetaStage = 0;
+            remoteReadSCount = 0;
+        }
 #if DEBUG
         DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         if (hdrLen) {
@@ -325,86 +403,98 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
 #define HCI_EVT_LE_META                               0x3E
 #define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
 
-uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
 // #514: LE Data Length Change (LE Meta subevent 0x07, no status byte -> handle at [3][4]).
 // bluetoothd stalls at LE_READY_WAIT_FOR_LENGTH after PHY until it sees this. 27 octets / 328us tx+rx.
-// Made by Claude.
 uint8_t fakeDataLengthChangeEvent[13] = {0x3E, 0x0B, 0x07, 0x00, 0x00, 0x1B, 0x00, 0x48, 0x01, 0x1B, 0x00, 0x48, 0x01};
-//uint8_t remoteFeaturesStatus[6] = {0x0F, 0x04, 0x00, 0x01, 0x16, 0x20};
+
+// Rewrites one HCI event transfer in place:
+//  - hides LE Data Packet Length Extension (bit5) in the LE Read Local Supported
+//    Features Command Complete (existing EDL workaround);
+//  - on the FIRST real LE Read Remote Features Complete (LE Meta 0x04), appends
+//    one 13-byte fake LE Data Length Change event to the same transfer.
+static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTransferred)
+{
+    if (dataBuffer == nullptr || bytesTransferred < sizeof(HciEventHdr))
+        return;
+
+    uint32_t origLen = bytesTransferred;
+    uint32_t fakeLen = (uint32_t)sizeof(fakeDataLengthChangeEvent);
+    // Reserve room for the optional appended event; never write past this.
+    uint32_t allocLen = origLen + fakeLen;
+    void *buffer = IOMalloc(allocLen);
+    if (buffer == nullptr)
+        return;
+
+    if (dataBuffer->getLength() > 0 &&
+        (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
+        dataBuffer->readBytes(0, buffer, origLen);
+        HciEventHdr *hdr = (HciEventHdr *)buffer;
+        bool hdrComplete = ((uint32_t)hdr->len + sizeof(HciEventHdr)) <= origLen;
+
+        // Experimental fix: hide LE Data Packet Length Extension (bit5) from
+        // bluetoothd in the LE Read Local Supported Features Command Complete.
+        // If the controller does not advertise EDL, bluetoothd should not enter
+        // LE_READY_WAIT_FOR_LENGTH at all.
+        if (hdrComplete && hdr->evt == 0x0E && hdr->len >= 12 &&
+            hdr->data[1] == 0x03 && hdr->data[2] == 0x20 &&
+            (hdr->data[4] & 0x20) != 0) {
+            hdr->data[4] &= (uint8_t)~0x20;
+            dataBuffer->writeBytes(0, buffer, origLen);
+            g_edlCleared++;
+            publishDeviceInt("IBTPEDLClear", g_edlCleared);
+        }
+
+        // Single-event injection: append the fake LE Data Length Change right
+        // after the first real LE Read Remote Features Complete. Handle bytes
+        // are copied from the real event (data[2] = lo, data[3] = hi).
+        if (hdrComplete && hdr->evt == HCI_EVT_LE_META && hdr->len >= 4 &&
+            hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE &&
+            g_leMetaStage == 0) {
+            g_leMetaStage = 1;
+            remoteReadSCount = 0;
+            if (dataBuffer->getLength() >= origLen + fakeLen) {
+                uint16_t handle = (uint16_t)hdr->data[2] | ((uint16_t)hdr->data[3] << 8);
+                uint8_t fakeEvent[sizeof(fakeDataLengthChangeEvent)];
+                memcpy(fakeEvent, fakeDataLengthChangeEvent, fakeLen);
+                fakeEvent[3] = hdr->data[2];
+                fakeEvent[4] = hdr->data[3];
+                memcpy((uint8_t *)buffer + origLen, fakeEvent, fakeLen);
+                dataBuffer->writeBytes(0, buffer, origLen + fakeLen);
+                bytesTransferred = origLen + fakeLen;
+                g_injected++;
+                publishDeviceInt("IBTPInjected", g_injected);
+                char hb[16];
+                snprintf(hb, sizeof(hb), "0x%04X", (unsigned int)handle);
+                publishDeviceString("IBTPHandle", hb);
+            }
+        }
+
+        if (getKernelVersion() >= KernelVersion::Sequoia)
+            dataBuffer->complete(kIODirectionInOut);
+    }
+    IOFree(buffer, allocLen);
+}
 
 static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
 {
     AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
-    IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
-    // #514 3-stage rewrite of the repeated LE Read Remote Features Complete (0x04) events:
-    //   stage 0 = the real one (pass through), 1 = rewrite to fake PHY Update Complete,
-    //   2 = rewrite to fake LE Data Length Change (clears bluetoothd's LE_READY_WAIT_FOR_LENGTH).
-    uint32_t allocLen = bytesTransferred;
-
-    if (dataBuffer && bytesTransferred) {
-        void *buffer = IOMalloc(allocLen);
-        if (buffer) {
-            if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
-                dataBuffer->readBytes(0, buffer, allocLen);
-                HciEventHdr *hdr = (HciEventHdr *)buffer;
-                // Experimental fix: hide LE Data Packet Length Extension (bit5) from
-                // bluetoothd in the LE Read Local Supported Features Command Complete.
-                // If the controller does not advertise EDL, bluetoothd should not enter
-                // LE_READY_WAIT_FOR_LENGTH at all.
-                if (hdr->evt == 0x0E && hdr->len >= 12 &&
-                    hdr->data[1] == 0x03 && hdr->data[2] == 0x20 &&
-                    (hdr->data[4] & 0x20) != 0) {
-                    hdr->data[4] &= (uint8_t)~0x20;
-                    dataBuffer->writeBytes(0, buffer, allocLen);
-                    g_edlCleared++;
-                    if (g_btDevice != nullptr) {
-                        char eb[16];
-                        snprintf(eb, sizeof(eb), "%d", g_edlCleared);
-                        g_btDevice->setProperty("IBTPEDLClear", OSData::withBytes(eb, strlen(eb)));
-                    }
-                }
-                if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                    if (g_leMetaStage == 0) {
-                        // Robust path for controllers that never send duplicate 0x04 events:
-                        // append a synthetic LE Data Length Change right after the real
-                        // LE Read Remote Features Complete, in the same transfer.
-                        if (dataBuffer->getLength() >= allocLen + 13) {
-                            fakeDataLengthChangeEvent[3] = hdr->data[2];
-                            fakeDataLengthChangeEvent[4] = hdr->data[3];
-                            memcpy((uint8_t *)buffer + allocLen, fakeDataLengthChangeEvent, 13);
-                            dataBuffer->writeBytes(0, buffer, allocLen + 13);
-                            bytesTransferred = allocLen + 13;
-                            g_injected++;
-                            if (g_btDevice != nullptr) {
-                                char ib[16];
-                                snprintf(ib, sizeof(ib), "%d", g_injected);
-                                g_btDevice->setProperty("IBTPInjected", OSData::withBytes(ib, strlen(ib)));
-                            }
-                        }
-                        g_leMetaStage = 1;            // real features complete -> pass through
-                    } else if (g_leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
-                        fakePhyUpdateCompleteEvent[4] = hdr->data[2];
-                        fakePhyUpdateCompleteEvent[5] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakePhyUpdateCompleteEvent, 8);
-                        bytesTransferred = 8;
-                        g_leMetaStage = 2;
-                        remoteReadSCount--;
-                    } else {                        // 2nd duplicate -> fake LE Data Length Change
-                        fakeDataLengthChangeEvent[3] = hdr->data[2];
-                        fakeDataLengthChangeEvent[4] = hdr->data[3];
-                        dataBuffer->writeBytes(0, fakeDataLengthChangeEvent, 13);
-                        bytesTransferred = 13;
-                        g_leMetaStage = 0;
-                        remoteReadSCount--;
-                    }
-                }
-                if (getKernelVersion() >= KernelVersion::Sequoia) dataBuffer->complete(kIODirectionInOut);
-            }
-            IOFree(buffer, allocLen);
-        }
-    }
+    rewriteHciEvent(asyncOwner->dataBuffer, bytesTransferred);
     if (asyncOwner->action)
         asyncOwner->action(asyncOwner->owner, parameter, status, bytesTransferred);
+    delete asyncOwner;
+}
+
+static void asyncBundledCompletion(void* owner, uint32_t ioCompletionCount, IOMemoryDescriptor** dataBufferArray, void** parameter, IOReturn* statusArray, uint32_t* actualByteCountArray)
+{
+    AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
+    if (asyncOwner->bundledAction && dataBufferArray && actualByteCountArray) {
+        for (uint32_t i = 0; i < ioCompletionCount; i++) {
+            uint32_t bytesTransferred = actualByteCountArray[i];
+            rewriteHciEvent(dataBufferArray[i], bytesTransferred);
+            actualByteCountArray[i] = bytesTransferred;
+        }
+        asyncOwner->bundledAction(asyncOwner->owner, ioCompletionCount, dataBufferArray, parameter, statusArray, actualByteCountArray);
+    }
     delete asyncOwner;
 }
 
@@ -425,18 +515,88 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
             g_btDevice->setProperty("IBTPAsyncSeen", OSData::withBytes(b, strlen(b)));
         }
     }
-    if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+    // On Tahoe, IOUSBHostPipe::io tail-jumps into IOUSBHostIOSource::io, which
+    // is hooked below. Wrapping here as well would wrap the same completion
+    // twice, so only do it when the IOSource::io(Completion) route is absent.
+    if (!_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         interceptedAsyncCount++;
         if (g_btDevice != nullptr)
             g_btDevice->setProperty("IBTPAsyncHit", OSData::withBytes("Y", 1));
-        AsyncOwnerData *ownerData = new AsyncOwnerData;
+        AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = completion->action;
+        ownerData->bundledAction = nullptr;
         ownerData->owner = completion->owner;
         ownerData->dataBuffer = dataBuffer;
         completion->action = asyncIOCompletion;
         completion->owner = ownerData;
     }
     return FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
+}
+
+bool CIntelBTPatcher::isHookedIOSource(void *that)
+{
+    return that != nullptr && g_btDevice != nullptr && that == _hookPipeInstance;
+}
+
+IOReturn CIntelBTPatcher::
+newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
+{
+    if (isHookedIOSource(that)) {
+        g_iosSourceHits++;
+        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+    }
+    if (isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+        AsyncOwnerData *ownerData = new AsyncOwnerData();
+        ownerData->action = completion->action;
+        ownerData->bundledAction = nullptr;
+        ownerData->owner = completion->owner;
+        ownerData->dataBuffer = dataBuffer;
+        IOUSBHostCompletion wrappedCompletion = *completion;
+        wrappedCompletion.owner = ownerData;
+        wrappedCompletion.action = asyncIOCompletion;
+        IOReturn ret = FunctionCast(newIOSourceIOCompletion, callbackIBTPatcher->oldIOSourceIOCompletion)(that, dataBuffer, dataBufferLength, &wrappedCompletion, completionTimeoutMs);
+        if (ret != kIOReturnSuccess)
+            delete ownerData;
+        return ret;
+    }
+    return FunctionCast(newIOSourceIOCompletion, callbackIBTPatcher->oldIOSourceIOCompletion)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
+}
+
+IOReturn CIntelBTPatcher::
+newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, uint32_t &bytesTransferred, uint32_t completionTimeoutMs)
+{
+    if (isHookedIOSource(that)) {
+        g_iosSourceHits++;
+        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+    }
+    IOReturn ret = FunctionCast(newIOSourceIORjj, callbackIBTPatcher->oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
+    if (ret == kIOReturnSuccess && remoteReadSCount > 0 && isHookedIOSource(that))
+        rewriteHciEvent(dataBuffer, bytesTransferred);
+    return ret;
+}
+
+IOReturn CIntelBTPatcher::
+newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostBundledCompletion* completion, uint32_t completionTimeoutMs)
+{
+    if (isHookedIOSource(that)) {
+        g_iosSourceHits++;
+        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+    }
+    if (isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+        AsyncOwnerData *ownerData = new AsyncOwnerData();
+        ownerData->action = nullptr;
+        ownerData->bundledAction = completion->action;
+        ownerData->owner = completion->owner;
+        ownerData->dataBuffer = dataBuffer;
+        IOUSBHostBundledCompletion wrappedCompletion = *completion;
+        wrappedCompletion.owner = ownerData;
+        wrappedCompletion.action = asyncBundledCompletion;
+        IOReturn ret = FunctionCast(newIOSourceIOBundled, callbackIBTPatcher->oldIOSourceIOBundled)(that, dataBuffer, dataBufferLength, &wrappedCompletion, completionTimeoutMs);
+        if (ret != kIOReturnSuccess)
+            delete ownerData;
+        return ret;
+    }
+    return FunctionCast(newIOSourceIOBundled, callbackIBTPatcher->oldIOSourceIOBundled)(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 }
 
 #define VENDOR_USB_INTEL 0x8087
@@ -458,11 +618,18 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
             CIntelBTPatcher::_hookPipeInstance = that;
             g_btDevice = device;
             {
-                char rb[64];
-                snprintf(rb, sizeof(rb), "dev=%ld async=%ld initCfg=%ld initPipe=%ld",
-                         g_routeDevReqErr, g_routeAsyncIOErr, g_routeInitCfgErr, g_routeInitPipeErr);
+                char rb[160];
+                snprintf(rb, sizeof(rb), "dev=%ld async=%ld iosC=%ld iosR=%ld iosB=%ld initCfg=%ld initPipe=%ld",
+                         g_routeDevReqErr, g_routeAsyncIOErr,
+                         g_routeIOSourceIOCompletionErr, g_routeIOSourceIORjjErr, g_routeIOSourceIOBundledErr,
+                         g_routeInitCfgErr, g_routeInitPipeErr);
                 device->setProperty("IBTPRouteErr", OSData::withBytes(rb, strlen(rb)));
             }
+            publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+            publishDeviceInt("IBTPInjected", g_injected);
+            publishDeviceInt("IBTPEDLClear", g_edlCleared);
+            if (device->getProperty("IBTPHandle") == nullptr)
+                publishDeviceString("IBTPHandle", "none");
             if (device->getProperty("IBTPPipeCaptured") == nullptr) {
                 device->setProperty("IBTPPipeCaptured", OSData::withBytes("Y", 1));
                 char pbuf[32];
