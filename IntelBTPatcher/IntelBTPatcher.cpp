@@ -17,6 +17,10 @@ static long g_routeDevReqErr = -999;
 static long g_routeAsyncIOErr = -999;
 static long g_routeInitCfgErr = -999;
 static long g_routeInitPipeErr = -999;
+static int g_devReqTotal = 0;
+static int g_hciCmdCount = 0;
+static unsigned int g_lastBm = 0;
+static unsigned int g_lastReq = 0;
 
 static const char *bootargOff[] {
     "-ibtcompatoff"
@@ -228,6 +232,17 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
         IOUSBHostDevice *dev = (IOUSBHostDevice *)that;
         if (dev->getProperty("IBTPDevReq") == nullptr)
             dev->setProperty("IBTPDevReq", OSData::withBytes("Y", 1));
+        g_devReqTotal++;
+        g_lastBm = request.bmRequestType;
+        g_lastReq = request.bRequest;
+        if (request.bmRequestType == 0x20)
+            g_hciCmdCount++;
+        if (g_btDevice != nullptr) {
+            char sb[96];
+            snprintf(sb, sizeof(sb), "total=%d hci=%d lastBm=0x%02x lastReq=0x%02x",
+                     g_devReqTotal, g_hciCmdCount, g_lastBm, g_lastReq);
+            g_btDevice->setProperty("IBTPDevReqStat", OSData::withBytes(sb, strlen(sb)));
+        }
     }
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
