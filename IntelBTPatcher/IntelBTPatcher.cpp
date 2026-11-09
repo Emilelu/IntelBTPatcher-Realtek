@@ -13,6 +13,10 @@
 
 static CIntelBTPatcher ibtPatcher;
 static CIntelBTPatcher *callbackIBTPatcher = nullptr;
+static long g_routeDevReqErr = -999;
+static long g_routeAsyncIOErr = -999;
+static long g_routeInitCfgErr = -999;
+static long g_routeInitPipeErr = -999;
 
 static const char *bootargOff[] {
     "-ibtcompatoff"
@@ -214,10 +218,6 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 int remoteReadSCount = 0;
 int interceptedAsyncCount = 0;
 static IOUSBHostDevice *g_btDevice = nullptr;
-static long g_routeDevReqErr = -999;
-static long g_routeAsyncIOErr = -999;
-static long g_routeInitCfgErr = -999;
-static long g_routeInitPipeErr = -999;
 static int g_lrfSeen = 0;
 static int g_asyncSeen = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
