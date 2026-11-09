@@ -18,6 +18,7 @@ static long g_routeAsyncIOErr = -999;
 static long g_routeInitCfgErr = -999;
 static long g_routeInitPipeErr = -999;
 static int g_devReqTotal = 0;
+static int g_asyncAll = 0;
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
@@ -373,6 +374,12 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
+    g_asyncAll++;
+    if (g_btDevice != nullptr && (g_asyncAll % 50) == 1) {
+        char ab[48];
+        snprintf(ab, sizeof(ab), "asyncAll=%d lrf=%d hit=%d", g_asyncAll, g_lrfSeen, interceptedAsyncCount);
+        g_btDevice->setProperty("IBTPAsyncAll", OSData::withBytes(ab, strlen(ab)));
+    }
     if (remoteReadSCount > 0) {
         g_asyncSeen++;
         if (g_btDevice != nullptr) {
