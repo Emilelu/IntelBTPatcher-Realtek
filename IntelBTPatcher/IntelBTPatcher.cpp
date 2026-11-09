@@ -19,6 +19,8 @@ static long g_routeInitCfgErr = -999;
 static long g_routeInitPipeErr = -999;
 static int g_devReqTotal = 0;
 static int g_asyncAll = 0;
+static int g_leMetaStage = 0;
+static int g_edlCleared = 0;
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
@@ -290,7 +292,10 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
             }
             // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
             // (1st dup -> fake PHY Update Complete, 2nd dup -> fake LE Data Length Change).
-            remoteReadSCount += 2;
+            // Realtek only returns ONE real LE Read Remote Features Complete event.
+            // Reset (not +=) so the counter cannot grow unbounded and block the rewrite.
+            remoteReadSCount = 2;
+            g_leMetaStage = 0;
             FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
             FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
         }
@@ -333,7 +338,6 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
     // #514 3-stage rewrite of the repeated LE Read Remote Features Complete (0x04) events:
     //   stage 0 = the real one (pass through), 1 = rewrite to fake PHY Update Complete,
     //   2 = rewrite to fake LE Data Length Change (clears bluetoothd's LE_READY_WAIT_FOR_LENGTH).
-    static int leMetaStage = 0;
     uint32_t allocLen = bytesTransferred;
 
     if (dataBuffer && bytesTransferred) {
@@ -342,22 +346,38 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
             if (dataBuffer->getLength() > 0 && (getKernelVersion() < KernelVersion::Sequoia || !dataBuffer->prepare(kIODirectionInOut))) {
                 dataBuffer->readBytes(0, buffer, allocLen);
                 HciEventHdr *hdr = (HciEventHdr *)buffer;
+                // Experimental fix: hide LE Data Packet Length Extension (bit5) from
+                // bluetoothd in the LE Read Local Supported Features Command Complete.
+                // If the controller does not advertise EDL, bluetoothd should not enter
+                // LE_READY_WAIT_FOR_LENGTH at all.
+                if (hdr->evt == 0x0E && hdr->len >= 12 &&
+                    hdr->data[1] == 0x03 && hdr->data[2] == 0x20 &&
+                    (hdr->data[4] & 0x20) != 0) {
+                    hdr->data[4] &= (uint8_t)~0x20;
+                    dataBuffer->writeBytes(0, buffer, allocLen);
+                    g_edlCleared++;
+                    if (g_btDevice != nullptr) {
+                        char eb[16];
+                        snprintf(eb, sizeof(eb), "%d", g_edlCleared);
+                        g_btDevice->setProperty("IBTPEDLClear", OSData::withBytes(eb, strlen(eb)));
+                    }
+                }
                 if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                    if (leMetaStage == 0) {
-                        leMetaStage = 1;            // real features complete -> pass through
-                    } else if (leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
+                    if (g_leMetaStage == 0) {
+                        g_leMetaStage = 1;            // real features complete -> pass through
+                    } else if (g_leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
                         fakePhyUpdateCompleteEvent[4] = hdr->data[2];
                         fakePhyUpdateCompleteEvent[5] = hdr->data[3];
                         dataBuffer->writeBytes(0, fakePhyUpdateCompleteEvent, 8);
                         bytesTransferred = 8;
-                        leMetaStage = 2;
+                        g_leMetaStage = 2;
                         remoteReadSCount--;
                     } else {                        // 2nd duplicate -> fake LE Data Length Change
                         fakeDataLengthChangeEvent[3] = hdr->data[2];
                         fakeDataLengthChangeEvent[4] = hdr->data[3];
                         dataBuffer->writeBytes(0, fakeDataLengthChangeEvent, 13);
                         bytesTransferred = 13;
-                        leMetaStage = 0;
+                        g_leMetaStage = 0;
                         remoteReadSCount--;
                     }
                 }
