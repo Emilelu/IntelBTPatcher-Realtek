@@ -21,6 +21,7 @@ static int g_devReqTotal = 0;
 static int g_asyncAll = 0;
 static int g_leMetaStage = 0;
 static int g_edlCleared = 0;
+static int g_injected = 0;
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
@@ -364,6 +365,22 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
                 }
                 if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
                     if (g_leMetaStage == 0) {
+                        // Robust path for controllers that never send duplicate 0x04 events:
+                        // append a synthetic LE Data Length Change right after the real
+                        // LE Read Remote Features Complete, in the same transfer.
+                        if (dataBuffer->getLength() >= allocLen + 13) {
+                            fakeDataLengthChangeEvent[3] = hdr->data[2];
+                            fakeDataLengthChangeEvent[4] = hdr->data[3];
+                            memcpy((uint8_t *)buffer + allocLen, fakeDataLengthChangeEvent, 13);
+                            dataBuffer->writeBytes(0, buffer, allocLen + 13);
+                            bytesTransferred = allocLen + 13;
+                            g_injected++;
+                            if (g_btDevice != nullptr) {
+                                char ib[16];
+                                snprintf(ib, sizeof(ib), "%d", g_injected);
+                                g_btDevice->setProperty("IBTPInjected", OSData::withBytes(ib, strlen(ib)));
+                            }
+                        }
                         g_leMetaStage = 1;            // real features complete -> pass through
                     } else if (g_leMetaStage == 1) {  // 1st duplicate -> fake PHY Update Complete
                         fakePhyUpdateCompleteEvent[4] = hdr->data[2];
