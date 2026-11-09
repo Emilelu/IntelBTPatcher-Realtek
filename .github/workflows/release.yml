@@ -1,0 +1,66 @@
+name: Release
+
+# Hardened release pipeline: builds the kexts on a macOS runner and publishes a GitHub Release.
+# - Manual trigger only (never publishes on push / pull_request).
+# - External action pinned to a commit SHA (Rule 1).
+# - Least-privilege: read-only token by default; only the release job gets contents:write (Rule 4).
+# - Publish is gated behind the `release` GitHub Environment (add a required reviewer there).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v2.5.2-dlc)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: macos-latest
+    environment: release
+    permissions:
+      contents: write          # only this job may write — to create the GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install MacKernelSDK
+        run: git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+
+      - name: Build Lilu SDK
+        run: |
+          git clone --depth=1 https://github.com/acidanthera/Lilu.git
+          cd Lilu
+          ln -s ../MacKernelSDK MacKernelSDK
+          xcodebuild -configuration Debug -arch x86_64
+          test -d build/Debug/Lilu.kext
+          cp -R build/Debug/Lilu.kext ../
+
+      - name: Build Debug + Release
+        run: |
+          xcodebuild -alltargets -configuration Debug
+          xcodebuild -alltargets -configuration Release
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find build -name '*.zip' -exec cp {} dist/ \;
+          ls -la dist
+          test -n "$(ls -A dist)" || { echo "no build artifacts produced"; exit 1; }
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [ "${{ inputs.prerelease }}" = "true" ] && flags+=(--prerelease)
+          gh release create "${{ inputs.tag }}" dist/*.zip \
+            --title "${{ inputs.tag }}" \
+            --notes "Automated build of ${{ inputs.tag }} (IntelBTPatcher + IntelBluetoothFirmware + IntelBluetoothInjector)." \
+            "${flags[@]}"
