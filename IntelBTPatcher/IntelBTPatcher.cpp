@@ -208,8 +208,16 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 #define HCI_OP_LE_READ_REMOTE_FEATURES  0x2016
 
 int remoteReadSCount = 0;
+int interceptedAsyncCount = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
+    // Publish a marker on the real IOUSBHostDevice so we can verify from userland
+    // (ioreg) that the deviceRequest hook actually fired.
+    if (that != nullptr) {
+        IOUSBHostDevice *dev = (IOUSBHostDevice *)that;
+        if (dev->getProperty("IBTPDevReq") == nullptr)
+            dev->setProperty("IBTPDevReq", OSData::withBytes("Y", 1));
+    }
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
@@ -334,6 +342,7 @@ IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
     if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+        interceptedAsyncCount++;
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->owner = completion->owner;
@@ -361,6 +370,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
+            if (device->getProperty("IBTPPipeCaptured") == nullptr) {
+                device->setProperty("IBTPPipeCaptured", OSData::withBytes("Y", 1));
+                char pbuf[32];
+                snprintf(pbuf, sizeof(pbuf), "%lx", (unsigned long)(uintptr_t)that);
+                device->setProperty("IBTPPipeAddr", OSData::withBytes(pbuf, strlen(pbuf)));
+            }
             if (isRealtek)
                 IOLog("IntelBTPatcher: [Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed\n", device->getName());
         }
