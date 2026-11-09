@@ -130,6 +130,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 oldHostDeviceRequest
             };
             patcher.routeMultiple(index, &hostDeviceRequest, 1, address, size);
+            g_routeDevReqErr = (long)patcher.getError();
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 IOLog("IntelBTPatcher: routed %s\n", hostDeviceRequest.symbol);
             } else {
@@ -143,6 +144,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 oldAsyncIO
             };
             patcher.routeMultiple(index, &asyncIORequest, 1, address, size);
+            g_routeAsyncIOErr = (long)patcher.getError();
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 IOLog("IntelBTPatcher: routed %s\n", asyncIORequest.symbol);
             } else {
@@ -157,6 +159,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 oldInitPipeConfig
             };
             patcher.routeMultiple(index, &initPipeConfigRequest, 1, address, size);
+            g_routeInitCfgErr = (long)patcher.getError();
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 IOLog("IntelBTPatcher: routed %s\n", initPipeConfigRequest.symbol);
             } else {
@@ -170,6 +173,7 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 oldInitPipe
             };
             patcher.routeMultiple(index, &initPipeRequest, 1, address, size);
+            g_routeInitPipeErr = (long)patcher.getError();
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 IOLog("IntelBTPatcher: routed %s\n", initPipeRequest.symbol);
             } else {
@@ -210,6 +214,10 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 int remoteReadSCount = 0;
 int interceptedAsyncCount = 0;
 static IOUSBHostDevice *g_btDevice = nullptr;
+static long g_routeDevReqErr = -999;
+static long g_routeAsyncIOErr = -999;
+static long g_routeInitCfgErr = -999;
+static long g_routeInitPipeErr = -999;
 static int g_lrfSeen = 0;
 static int g_asyncSeen = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
@@ -390,6 +398,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
             g_btDevice = device;
+            {
+                char rb[64];
+                snprintf(rb, sizeof(rb), "dev=%ld async=%ld initCfg=%ld initPipe=%ld",
+                         g_routeDevReqErr, g_routeAsyncIOErr, g_routeInitCfgErr, g_routeInitPipeErr);
+                device->setProperty("IBTPRouteErr", OSData::withBytes(rb, strlen(rb)));
+            }
             if (device->getProperty("IBTPPipeCaptured") == nullptr) {
                 device->setProperty("IBTPPipeCaptured", OSData::withBytes("Y", 1));
                 char pbuf[32];
