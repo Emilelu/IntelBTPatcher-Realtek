@@ -34,11 +34,11 @@ jobs:
         git clone --depth=1 https://github.com/acidanthera/Lilu.git
         cd Lilu || exit 1
         ln -s ../MacKernelSDK MacKernelSDK
-        xcodebuild -configuration Debug -arch x86_64 | xcpretty && ret=${PIPESTATUS[0]}
-        if [[ $ret -ne 0 || ! -d build/Debug/Lilu.kext ]]; then
+        xcodebuild -configuration Release -arch x86_64 | xcpretty && ret=${PIPESTATUS[0]}
+        if [[ $ret -ne 0 || ! -d build/Release/Lilu.kext ]]; then
           exit 1
         fi
-        cp -R build/Debug/Lilu.kext ../
+        cp -R build/Release/Lilu.kext ../
 
     - name: Debug Build
       run: |
