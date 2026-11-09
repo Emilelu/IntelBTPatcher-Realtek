@@ -26,6 +26,7 @@ static int g_leMetaStage = 0;
 static int g_edlCleared = 0;
 static int g_injected = 0;
 static int g_iosSourceHits = 0;
+static bool g_wrapEnabled = false;   // only with -ibtpwrap: actually rewrite/wrap
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
@@ -90,6 +91,7 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 
 bool CIntelBTPatcher::init()
 {
+    g_wrapEnabled = checkKernelArgument("-ibtpwrap");
     IOLog("IntelBTPatcher: init() called, kernel=%d\n", (int)getKernelVersion());
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
@@ -518,7 +520,7 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
     // On Tahoe, IOUSBHostPipe::io tail-jumps into IOUSBHostIOSource::io, which
     // is hooked below. Wrapping here as well would wrap the same completion
     // twice, so only do it when the IOSource::io(Completion) route is absent.
-    if (!_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+    if (g_wrapEnabled && !_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         interceptedAsyncCount++;
         if (g_btDevice != nullptr)
             g_btDevice->setProperty("IBTPAsyncHit", OSData::withBytes("Y", 1));
@@ -544,8 +546,10 @@ newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dat
     if (isHookedIOSource(that)) {
         g_iosSourceHits++;
         publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+    if (g_btDevice != nullptr)
+        g_btDevice->setProperty("IBTPWrapEnabled", OSData::withBytes(g_wrapEnabled ? "Y" : "N", 1));
     }
-    if (isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+    if (g_wrapEnabled && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -570,7 +574,7 @@ newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBuffer
         publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
     }
     IOReturn ret = FunctionCast(newIOSourceIORjj, callbackIBTPatcher->oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-    if (ret == kIOReturnSuccess && remoteReadSCount > 0 && isHookedIOSource(that))
+    if (g_wrapEnabled && ret == kIOReturnSuccess && remoteReadSCount > 0 && isHookedIOSource(that))
         rewriteHciEvent(dataBuffer, bytesTransferred);
     return ret;
 }
@@ -582,7 +586,7 @@ newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBu
         g_iosSourceHits++;
         publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
     }
-    if (isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+    if (g_wrapEnabled && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = nullptr;
         ownerData->bundledAction = completion->action;
