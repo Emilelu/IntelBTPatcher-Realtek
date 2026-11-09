@@ -39,7 +39,9 @@ PluginConfiguration ADDPR(config) {
     KernelVersion::MountainLion,
     KernelVersion::Tahoe,
     []() {
+        IOLog("IntelBTPatcher: plugin start lambda entered\n");
         ibtPatcher.init();
+        IOLog("IntelBTPatcher: init returned\n");
     }
 };
 
@@ -71,6 +73,7 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 
 bool CIntelBTPatcher::init()
 {
+    IOLog("IntelBTPatcher: init() called, kernel=%d\n", (int)getKernelVersion());
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
     if (getKernelVersion() < KernelVersion::Monterey) {
@@ -94,6 +97,10 @@ void CIntelBTPatcher::free()
 
 void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
+    IOLog("IntelBTPatcher: processKext index=%lu usbLoadIndex=%lu btLoadIndex=%lu\n",
+          (unsigned long)index,
+          (unsigned long)IntelBTPatcher_IOUsbHostInfo.loadIndex,
+          (unsigned long)IntelBTPatcher_IOBluetoothInfo.loadIndex);
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     if (getKernelVersion() < KernelVersion::Monterey) {
         if (IntelBTPatcher_IOBluetoothInfo.loadIndex == index) {
