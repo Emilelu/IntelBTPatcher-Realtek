@@ -209,6 +209,9 @@ IOBufferMemoryDescriptor *writeHCIDescriptor = nullptr;
 
 int remoteReadSCount = 0;
 int interceptedAsyncCount = 0;
+static IOUSBHostDevice *g_btDevice = nullptr;
+static int g_lrfSeen = 0;
+static int g_asyncSeen = 0;
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
 {
     // Publish a marker on the real IOUSBHostDevice so we can verify from userland
@@ -255,6 +258,12 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 IOLog("IntelBTPatcher: [PATCH] Resend LE SCAN PARAM HCI %d\n", ret);
             }
         } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
+            g_lrfSeen++;
+            if (g_btDevice != nullptr) {
+                char b[16];
+                snprintf(b, sizeof(b), "%d", g_lrfSeen);
+                g_btDevice->setProperty("IBTPReqLRF", OSData::withBytes(b, strlen(b)));
+            }
             // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
             // (1st dup -> fake PHY Update Complete, 2nd dup -> fake LE Data Length Change).
             remoteReadSCount += 2;
@@ -341,8 +350,18 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
+    if (remoteReadSCount > 0) {
+        g_asyncSeen++;
+        if (g_btDevice != nullptr) {
+            char b[16];
+            snprintf(b, sizeof(b), "%d", g_asyncSeen);
+            g_btDevice->setProperty("IBTPAsyncSeen", OSData::withBytes(b, strlen(b)));
+        }
+    }
     if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         interceptedAsyncCount++;
+        if (g_btDevice != nullptr)
+            g_btDevice->setProperty("IBTPAsyncHit", OSData::withBytes("Y", 1));
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
         ownerData->owner = completion->owner;
@@ -370,6 +389,7 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
+            g_btDevice = device;
             if (device->getProperty("IBTPPipeCaptured") == nullptr) {
                 device->setProperty("IBTPPipeCaptured", OSData::withBytes("Y", 1));
                 char pbuf[32];
