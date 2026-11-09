@@ -108,14 +108,14 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             if (patcher.getError() == KernelPatcher::Error::NoError) {
                 DBGLOG(DRV_NAME, "routed %s", findQueueRequestRequest.symbol);
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", findQueueRequestRequest.symbol, patcher.getError());
+                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", findQueueRequestRequest.symbol, patcher.getError() "\n");
                 patcher.clearError();
             }
             
         }
     } else {
         if (IntelBTPatcher_IOUsbHostInfo.loadIndex == index) {
-            SYSLOG(DRV_NAME, "%s", IntelBTPatcher_IOUsbHostInfo.id);
+            IOLog("IntelBTPatcher: " "%s", IntelBTPatcher_IOUsbHostInfo.id "\n");
             
             KernelPatcher::RouteRequest hostDeviceRequest {
             "__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
@@ -124,9 +124,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &hostDeviceRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                SYSLOG(DRV_NAME, "routed %s", hostDeviceRequest.symbol);
+                IOLog("IntelBTPatcher: " "routed %s", hostDeviceRequest.symbol "\n");
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError());
+                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError() "\n");
                 patcher.clearError();
             }
 
@@ -137,9 +137,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &asyncIORequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                SYSLOG(DRV_NAME, "routed %s", asyncIORequest.symbol);
+                IOLog("IntelBTPatcher: " "routed %s", asyncIORequest.symbol "\n");
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", asyncIORequest.symbol, patcher.getError());
+                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", asyncIORequest.symbol, patcher.getError() "\n");
                 patcher.clearError();
             }
 
@@ -151,9 +151,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &initPipeConfigRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                SYSLOG(DRV_NAME, "routed %s", initPipeConfigRequest.symbol);
+                IOLog("IntelBTPatcher: " "routed %s", initPipeConfigRequest.symbol "\n");
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeConfigRequest.symbol, patcher.getError());
+                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", initPipeConfigRequest.symbol, patcher.getError() "\n");
                 patcher.clearError();
             }
 
@@ -164,9 +164,9 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
             };
             patcher.routeMultiple(index, &initPipeRequest, 1, address, size);
             if (patcher.getError() == KernelPatcher::Error::NoError) {
-                SYSLOG(DRV_NAME, "routed %s", initPipeRequest.symbol);
+                IOLog("IntelBTPatcher: " "routed %s", initPipeRequest.symbol "\n");
             } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeRequest.symbol, patcher.getError());
+                IOLog("IntelBTPatcher: " "failed to resolve %s, error = %d", initPipeRequest.symbol, patcher.getError() "\n");
                 patcher.clearError();
             }
         }
@@ -233,11 +233,11 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 writeHCIDescriptor->complete(kIODirectionInOut);
                 const char *randAddressDump = _hexDumpHCIData((uint8_t *)randomAddressHci, 9);
                 if (randAddressDump) {
-                    SYSLOG(DRV_NAME, "[PATCH] Sending Random Address HCI %d %s", ret, randAddressDump);
+                    IOLog("IntelBTPatcher: " "[PATCH] Sending Random Address HCI %d %s", ret, randAddressDump "\n");
                     IOFree((void *)randAddressDump, 9 * 3 + 1);
                 }
                 _randomAddressInit = true;
-                SYSLOG(DRV_NAME, "[PATCH] Resend LE SCAN PARAM HCI %d", ret);
+                IOLog("IntelBTPatcher: " "[PATCH] Resend LE SCAN PARAM HCI %d", ret "\n");
             }
         } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
             // #514: send TWO extra reads -> two duplicate 0x04 events to rewrite
@@ -350,12 +350,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
     if (deviceDescriptor && (deviceDescriptor->idVendor == VENDOR_USB_INTEL || deviceDescriptor->idVendor == VENDOR_USB_REALTEK)) {
         bool isRealtek = (deviceDescriptor->idVendor == VENDOR_USB_REALTEK);
         if (isRealtek)
-            SYSLOG(DRV_NAME, "[Realtek] vendor 0x0BDA matched, idProduct=0x%04x (%s)", deviceDescriptor->idProduct, device->getName());
+            IOLog("IntelBTPatcher: " "[Realtek] vendor 0x0BDA matched, idProduct=0x%04x (%s)", deviceDescriptor->idProduct, device->getName() "\n");
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
             if (isRealtek)
-                SYSLOG(DRV_NAME, "[Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed", device->getName());
+                IOLog("IntelBTPatcher: " "[Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed", device->getName() "\n");
         }
     }
 }
