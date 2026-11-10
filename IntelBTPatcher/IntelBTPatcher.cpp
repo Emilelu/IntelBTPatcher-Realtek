@@ -424,12 +424,6 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
     if (dataBuffer == nullptr || bytesTransferred < sizeof(HciEventHdr))
         return;
 
-    // Probe-only unless -ibtpwrap is present. Without this gate the EDL-bit
-    // hiding and the event injection run unconditionally, which silently
-    // rewrites HCI traffic even when the user asked for observation only.
-    if (!g_wrapEnabled)
-        return;
-
     uint32_t origLen = bytesTransferred;
     uint32_t fakeLen = (uint32_t)sizeof(fakeDataLengthChangeEvent);
     // Reserve room for the optional appended event; never write past this.
@@ -460,7 +454,7 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
         // Single-event injection: append the fake LE Data Length Change right
         // after the first real LE Read Remote Features Complete. Handle bytes
         // are copied from the real event (data[2] = lo, data[3] = hi).
-        if (hdrComplete && hdr->evt == HCI_EVT_LE_META && hdr->len >= 4 &&
+        if (g_wrapEnabled && hdrComplete && hdr->evt == HCI_EVT_LE_META && hdr->len >= 4 &&
             hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE &&
             g_leMetaStage == 0) {
             g_leMetaStage = 1;
