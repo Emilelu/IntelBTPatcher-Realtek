@@ -26,6 +26,11 @@ static int g_leMetaStage = 0;
 static int g_edlCleared = 0;
 static int g_injected = 0;
 static int g_iosSourceHits = 0;
+// Tahoe 26.7.3 workaround: PHY Update Complete injection resets the RTL8821CE.
+#ifndef IBTP_EMIT_PHY
+#define IBTP_EMIT_PHY 0
+#endif
+
 static bool g_wrapEnabled = false;   // only with -ibtpwrap: actually rewrite/wrap
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
@@ -419,6 +424,12 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
     if (dataBuffer == nullptr || bytesTransferred < sizeof(HciEventHdr))
         return;
 
+    // Probe-only unless -ibtpwrap is present. Without this gate the EDL-bit
+    // hiding and the event injection run unconditionally, which silently
+    // rewrites HCI traffic even when the user asked for observation only.
+    if (!g_wrapEnabled)
+        return;
+
     uint32_t origLen = bytesTransferred;
     uint32_t fakeLen = (uint32_t)sizeof(fakeDataLengthChangeEvent);
     // Reserve room for the optional appended event; never write past this.
@@ -454,24 +465,30 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
             g_leMetaStage == 0) {
             g_leMetaStage = 1;
             remoteReadSCount = 0;
-            // #514 needs BOTH events: LE PHY Update Complete first (clears PHY gate),
-            // then LE Data Length Change (clears LE_READY_WAIT_FOR_LENGTH).
-            const uint32_t phyLen = 8;
+            // Tahoe 26.7.3: injecting LE PHY Update Complete (0x0C) makes the
+            // controller re-run PHY negotiation mid-connection, which the RTL8821CE
+            // handles by soft-resetting the whole Bluetooth stack (keyboard can
+            // never finish pairing, bluetoothd cycles). Set IBTP_EMIT_PHY to 1 to
+            // restore the old 16-byte / two-event behaviour for older releases.
+            const uint32_t phyLen = IBTP_EMIT_PHY ? 8 : 0;
             const uint32_t totalLen = phyLen + fakeLen;
             if (dataBuffer->getLength() >= origLen + totalLen) {
                 uint16_t handle = (uint16_t)hdr->data[2] | ((uint16_t)hdr->data[3] << 8);
                 uint8_t *dst = (uint8_t *)buffer + origLen;
 
-                // LE PHY Update Complete: 3E 06 0C 00 <h_lo> <h_hi> 02 02
-                dst[0] = 0x3E; dst[1] = 0x06; dst[2] = 0x0C; dst[3] = 0x00;
-                dst[4] = hdr->data[2]; dst[5] = hdr->data[3];
-                dst[6] = 0x02; dst[7] = 0x02;
+                if (IBTP_EMIT_PHY) {
+                    // LE PHY Update Complete: 3E 06 0C 00 <h_lo> <h_hi> 02 02
+                    dst[0] = 0x3E; dst[1] = 0x06; dst[2] = 0x0C; dst[3] = 0x00;
+                    dst[4] = hdr->data[2]; dst[5] = hdr->data[3];
+                    dst[6] = 0x02; dst[7] = 0x02;
+                    dst += 8;
+                }
 
                 // LE Data Length Change: 3E 0B 07 <h_lo> <h_hi> 1B 00 48 01 1B 00 48 01
-                dst[8] = 0x3E; dst[9] = 0x0B; dst[10] = 0x07;
-                dst[11] = hdr->data[2]; dst[12] = hdr->data[3];
-                dst[13] = 0x1B; dst[14] = 0x00; dst[15] = 0x48; dst[16] = 0x01;
-                dst[17] = 0x1B; dst[18] = 0x00; dst[19] = 0x48; dst[20] = 0x01;
+                dst[0] = 0x3E; dst[1] = 0x0B; dst[2] = 0x07;
+                dst[3] = hdr->data[2]; dst[4] = hdr->data[3];
+                dst[5] = 0x1B; dst[6] = 0x00; dst[7] = 0x48; dst[8] = 0x01;
+                dst[9] = 0x1B; dst[10] = 0x00; dst[11] = 0x48; dst[12] = 0x01;
 
                 dataBuffer->writeBytes(0, buffer, origLen + totalLen);
                 bytesTransferred = origLen + totalLen;
