@@ -288,28 +288,65 @@ static IOUSBHostDevice *g_btDevice = nullptr;
 static int g_lrfSeen = 0;
 static int g_asyncSeen = 0;
 
-static void publishDeviceInt(const char *key, int value)
+// The captured IOUSBHostDevice is destroyed and rebuilt by the USB stack on
+// system sleep/wake (and on any re-enumeration).  A plain non-retained global
+// therefore becomes a dangling pointer, and the next ioreg marker write lands
+// on freed memory -- that is a kernel page fault at +0x268 of a NULL vtable
+// (observed on 2026-11-12 as a panic in newHostDeviceRequest 0.8s after wake).
+// We now retain the captured device so the object can never be deallocated
+// behind our back, and additionally verify the vtable slot before every call.
+static inline bool btDeviceUsable()
 {
-    if (g_btDevice == nullptr)
+    return g_btDevice != nullptr && *(const void *const *)g_btDevice != nullptr;
+}
+
+static void setBtDevice(IOUSBHostDevice *device)
+{
+    if (device == g_btDevice)
         return;
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d", value);
-    OSData *data = OSData::withBytes(buf, strlen(buf));
+    if (device != nullptr)
+        device->retain();
+    IOUSBHostDevice *old = g_btDevice;
+    g_btDevice = device;
+    if (old != nullptr)
+        old->release();
+}
+
+// setProperty() takes its own reference, so the OSData we build here must be
+// released by us or it leaks one kernel object per call (this runs on every
+// HCI device request, i.e. hundreds of times per boot).
+static void setPropData(IOUSBHostDevice *dev, const char *key, const char *bytes, unsigned int len)
+{
+    if (dev == nullptr || key == nullptr || bytes == nullptr)
+        return;
+    OSData *data = OSData::withBytes(bytes, len);
     if (data != nullptr) {
-        g_btDevice->setProperty(key, data);
+        dev->setProperty(key, data);
         data->release();
     }
 }
 
+static void setDeviceData(const char *key, const char *bytes, unsigned int len)
+{
+    if (!btDeviceUsable())
+        return;
+    setPropData(g_btDevice, key, bytes, len);
+}
+
+static void publishDeviceInt(const char *key, int value)
+{
+    if (!btDeviceUsable())
+        return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", value);
+    setDeviceData(key, buf, (unsigned int)strlen(buf));
+}
+
 static void publishDeviceString(const char *key, const char *value)
 {
-    if (g_btDevice == nullptr || value == nullptr)
+    if (!btDeviceUsable() || value == nullptr)
         return;
-    OSData *data = OSData::withBytes(value, strlen(value));
-    if (data != nullptr) {
-        g_btDevice->setProperty(key, data);
-        data->release();
-    }
+    setDeviceData(key, value, (unsigned int)strlen(value));
 }
 
 IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
@@ -318,18 +355,23 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     // (ioreg) that the deviceRequest hook actually fired.
     if (that != nullptr) {
         IOUSBHostDevice *dev = (IOUSBHostDevice *)that;
-        if (dev->getProperty("IBTPDevReq") == nullptr)
-            dev->setProperty("IBTPDevReq", OSData::withBytes("Y", 1));
+        if (dev->getProperty("IBTPDevReq") == nullptr) {
+            OSData *mark = OSData::withBytes("Y", 1);
+            if (mark != nullptr) {
+                dev->setProperty("IBTPDevReq", mark);
+                mark->release();
+            }
+        }
         g_devReqTotal++;
         g_lastBm = request.bmRequestType;
         g_lastReq = request.bRequest;
         if (request.bmRequestType == 0x20)
             g_hciCmdCount++;
-        if (g_btDevice != nullptr) {
+        if (btDeviceUsable()) {
             char sb[96];
             snprintf(sb, sizeof(sb), "total=%d hci=%d lastBm=0x%02x lastReq=0x%02x",
                      g_devReqTotal, g_hciCmdCount, g_lastBm, g_lastReq);
-            g_btDevice->setProperty("IBTPDevReqStat", OSData::withBytes(sb, strlen(sb)));
+            setDeviceData("IBTPDevReqStat", sb, (unsigned int)strlen(sb));
         }
     }
     HciCommandHdr *hdr = nullptr;
@@ -370,10 +412,10 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
             }
         } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
             g_lrfSeen++;
-            if (g_btDevice != nullptr) {
+            {
                 char b[16];
                 snprintf(b, sizeof(b), "%d", g_lrfSeen);
-                g_btDevice->setProperty("IBTPReqLRF", OSData::withBytes(b, strlen(b)));
+                setDeviceData("IBTPReqLRF", b, (unsigned int)strlen(b));
             }
             // #514 single-event injection: arm the completion rewrite for the
             // first real LE Read Remote Features Complete (LE Meta 0x04). The
@@ -527,17 +569,17 @@ IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
     g_asyncAll++;
-    if (g_btDevice != nullptr && (g_asyncAll % 50) == 1) {
+    if (btDeviceUsable() && (g_asyncAll % 50) == 1) {
         char ab[48];
         snprintf(ab, sizeof(ab), "asyncAll=%d lrf=%d hit=%d", g_asyncAll, g_lrfSeen, interceptedAsyncCount);
-        g_btDevice->setProperty("IBTPAsyncAll", OSData::withBytes(ab, strlen(ab)));
+        setDeviceData("IBTPAsyncAll", ab, (unsigned int)strlen(ab));
     }
     if (remoteReadSCount > 0) {
         g_asyncSeen++;
-        if (g_btDevice != nullptr) {
+        if (btDeviceUsable()) {
             char b[16];
             snprintf(b, sizeof(b), "%d", g_asyncSeen);
-            g_btDevice->setProperty("IBTPAsyncSeen", OSData::withBytes(b, strlen(b)));
+            setDeviceData("IBTPAsyncSeen", b, (unsigned int)strlen(b));
         }
     }
     // On Tahoe, IOUSBHostPipe::io tail-jumps into IOUSBHostIOSource::io, which
@@ -545,8 +587,7 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
     // twice, so only do it when the IOSource::io(Completion) route is absent.
     if (g_wrapEnabled && !_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         interceptedAsyncCount++;
-        if (g_btDevice != nullptr)
-            g_btDevice->setProperty("IBTPAsyncHit", OSData::withBytes("Y", 1));
+        setDeviceData("IBTPAsyncHit", "Y", 1);
         AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -569,8 +610,7 @@ newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dat
     if (isHookedIOSource(that)) {
         g_iosSourceHits++;
         publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
-    if (g_btDevice != nullptr)
-        g_btDevice->setProperty("IBTPWrapEnabled", OSData::withBytes(g_wrapEnabled ? "Y" : "N", 1));
+        setDeviceData("IBTPWrapEnabled", g_wrapEnabled ? "Y" : "N", 1);
     }
     if (g_wrapEnabled && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData();
@@ -643,14 +683,14 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt) {
             CIntelBTPatcher::_hookPipeInstance = that;
-            g_btDevice = device;
+            setBtDevice(device);
             {
                 char rb[160];
                 snprintf(rb, sizeof(rb), "dev=%ld async=%ld iosC=%ld iosR=%ld iosB=%ld initCfg=%ld initPipe=%ld",
                          g_routeDevReqErr, g_routeAsyncIOErr,
                          g_routeIOSourceIOCompletionErr, g_routeIOSourceIORjjErr, g_routeIOSourceIOBundledErr,
                          g_routeInitCfgErr, g_routeInitPipeErr);
-                device->setProperty("IBTPRouteErr", OSData::withBytes(rb, strlen(rb)));
+                setPropData(device, "IBTPRouteErr", rb, (unsigned int)strlen(rb));
             }
             publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
             publishDeviceInt("IBTPInjected", g_injected);
@@ -658,10 +698,10 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
             if (device->getProperty("IBTPHandle") == nullptr)
                 publishDeviceString("IBTPHandle", "none");
             if (device->getProperty("IBTPPipeCaptured") == nullptr) {
-                device->setProperty("IBTPPipeCaptured", OSData::withBytes("Y", 1));
+                setPropData(device, "IBTPPipeCaptured", "Y", 1);
                 char pbuf[32];
                 snprintf(pbuf, sizeof(pbuf), "%lx", (unsigned long)(uintptr_t)that);
-                device->setProperty("IBTPPipeAddr", OSData::withBytes(pbuf, strlen(pbuf)));
+                setPropData(device, "IBTPPipeAddr", pbuf, (unsigned int)strlen(pbuf));
             }
             if (isRealtek)
                 IOLog("IntelBTPatcher: [Realtek] interrupt pipe captured on %s, LE Data Length Change fix armed\n", device->getName());
