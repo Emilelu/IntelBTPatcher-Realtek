@@ -69,6 +69,45 @@ CXXFLAGS=(
 	-Wno-everything
 )
 
+# ld64 used to synthesise three things whenever -kext was passed: the writable
+# __kmod_info symbol, plus the __realmain/__antimain indirections that libkmod's
+# c_start.o / c_stop.o jump through.  The linker shipped with macOS 26
+# (ld-1267) dropped that synthesis, so a locally linked kext is rejected with
+#   cannot be placed in kernel collection because: kexts must have a
+#   _kmod_info symbol
+# Xcode-built binaries still get it from the older toolchain, which is why only
+# the local build broke.  Reproduce the structure by hand: layout and initial
+# values match what the old linker emitted (next=0, info_version=1, id=-1,
+# reference_count=-1), and the start/stop slots point straight at the
+# PRODUCT_NAME_kern_start / _kern_stop entry points that Lilu's
+# plugin_start.cpp exports.
+cat > "${OUT}/kmod_info.cpp" <<EOF
+#include <mach/kmod.h>
+
+extern "C" kern_return_t IntelBTPatcher_kern_start(kmod_info_t *, void *);
+extern "C" kern_return_t IntelBTPatcher_kern_stop(kmod_info_t *, void *);
+
+extern "C" {
+kmod_info_t kmod_info __attribute__((used, section("__DATA,__data"))) = {
+	nullptr,
+	KMOD_INFO_VERSION,
+	(uint32_t)-1,
+	{"com.zxystd.IntelBTPatcher"},
+	{"${VER}"},
+	-1,
+	nullptr,
+	0,
+	0,
+	0,
+	reinterpret_cast<kmod_start_func_t *>(&IntelBTPatcher_kern_start),
+	reinterpret_cast<kmod_stop_func_t *>(&IntelBTPatcher_kern_stop),
+};
+}
+EOF
+
+echo "== compiling kmod_info stub =="
+clang++ "${CXXFLAGS[@]}" -c "${OUT}/kmod_info.cpp" -o "${OUT}/kmod_info.o"
+
 echo "== compiling IntelBTPatcher.cpp =="
 clang++ "${CXXFLAGS[@]}" -c "${REPO}/IntelBTPatcher/IntelBTPatcher.cpp" -o "${OUT}/IntelBTPatcher.o"
 
@@ -79,7 +118,7 @@ echo "== linking =="
 clang++ -target x86_64-apple-macos10.15 -mkernel -nostdlib \
 	-Wl,-kext -Wl,-undefined,dynamic_lookup \
 	-L "${SDK}/Library/x86_64" \
-	"${OUT}/IntelBTPatcher.o" "${OUT}/plugin_start.o" \
+	"${OUT}/IntelBTPatcher.o" "${OUT}/plugin_start.o" "${OUT}/kmod_info.o" \
 	-lkmod -o "${OUT}/IntelBTPatcher"
 
 echo "== assembling ${KEXT} =="
@@ -88,12 +127,16 @@ cp "${OUT}/IntelBTPatcher" "${KEXT}/Contents/MacOS/IntelBTPatcher"
 
 VER="${VER}" python3 - "${REPO}/IntelBTPatcher/Info.plist" "${KEXT}/Contents/Info.plist" <<'PY'
 import os
+import plistlib
 import sys
 
 src, dst = sys.argv[1], sys.argv[2]
 ver = os.environ["VER"]
-text = open(src).read()
-for placeholder, value in {
+
+with open(src, "rb") as f:
+    info = plistlib.load(f)
+
+SUBSTS = {
     "$(DEVELOPMENT_LANGUAGE)": "en",
     "$(EXECUTABLE_NAME)": "IntelBTPatcher",
     "$(PRODUCT_BUNDLE_IDENTIFIER)": "com.zxystd.IntelBTPatcher",
@@ -102,15 +145,48 @@ for placeholder, value in {
     "$(PRODUCT_BUNDLE_PACKAGE_TYPE)": "KEXT",
     "$(MARKETING_VERSION)": ver,
     "$(CURRENT_PROJECT_VERSION)": ver,
-}.items():
-    text = text.replace(placeholder, value)
-assert "$(" not in text, "unsubstituted build-setting placeholder in Info.plist"
-open(dst, "w").write(text)
+}
+
+def fix(value):
+    if isinstance(value, str):
+        for placeholder, replacement in SUBSTS.items():
+            value = value.replace(placeholder, replacement)
+        assert "$(" not in value, f"unsubstituted build-setting placeholder: {value}"
+        return value
+    if isinstance(value, dict):
+        return {fix(k): fix(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [fix(v) for v in value]
+    return value
+
+info = fix(info)
+
+# Xcode's ProcessInfoPlistFile injects these from the target's build settings.
+# A kext without CFBundleSupportedPlatforms is rejected while the boot kext
+# collection is built, so the local script has to add them itself.
+info.update({
+    "CFBundleVersion": ver,
+    "CFBundleShortVersionString": ver,
+    "CFBundleSupportedPlatforms": ["MacOSX"],
+    "LSMinimumSystemVersion": "10.12",
+    "DTPlatformName": "macosx",
+    "DTCompiler": "com.apple.compilers.llvm.clang.1_0",
+    "CFBundlePackageType": "KEXT",
+})
+
+with open(dst, "wb") as f:
+    plistlib.dump(info, f)
 PY
 
 echo "== verify =="
 shasum -a 256 "${KEXT}/Contents/MacOS/IntelBTPatcher"
 plutil -p "${KEXT}/Contents/Info.plist" | grep CFBundleVersion
+# The kernel refuses a kext without _kmod_info, and OpenCore then skips it
+# silently, so fail the build instead of shipping an unloadable bundle.
+nm "${KEXT}/Contents/MacOS/IntelBTPatcher" | grep -q ' _kmod_info$' \
+	|| { echo "FATAL: _kmod_info missing -- kext would never load" >&2; exit 1; }
+plutil -p "${KEXT}/Contents/Info.plist" | grep -q CFBundleSupportedPlatforms \
+	|| { echo "FATAL: CFBundleSupportedPlatforms missing" >&2; exit 1; }
 # The baked-in VersionInfo string proves MODULE_VERSION reached the compiler:
 # REL-<maj><min><patch>-<build date>
 python3 - "${KEXT}/Contents/MacOS/IntelBTPatcher" <<'PY'

@@ -1,5 +1,35 @@
 # IntelBTPatcher 修改记录（Tahoe IOSource::io + 单事件注入）
 
+### Local (Xcode-free) build: two things the linker no longer does
+
+Building with `scripts/build-local.sh` produced a bundle that OpenCore
+injected but the kernel never loaded, with no complaint in the log. Two
+independent causes, both introduced by the toolchain rather than the source:
+
+1. **Missing `_kmod_info`.** `ld -kext` used to synthesise the writable
+   `__kmod_info` struct (and the `__realmain` / `__antimain` indirections that
+   `libkmod`'s `c_start.o` / `c_stop.o` jump through). The linker in macOS 26
+   (`ld-1267`) dropped that, so `kmutil` rejects the bundle with
+   `kexts must have a _kmod_info symbol`. `libkmod.a` only *references* the
+   symbol, so nothing defines it. The build now emits the struct by hand with
+   the layout the old linker used: `next=0`, `info_version=KMOD_INFO_VERSION`,
+   `id=(uint32_t)-1`, `name` = bundle id, `version` = `MODULE_VERSION`,
+   `reference_count=-1`, and `start`/`stop` pointing at
+   `<PRODUCT_NAME>_kern_start` / `_kern_stop` from Lilu's `plugin_start.cpp`.
+   Getting `info_version` wrong produces the distinct error
+   `unsupported kmod_info version of 0`.
+
+2. **Missing `CFBundleSupportedPlatforms`.** Xcode's `ProcessInfoPlistFile`
+   injects `CFBundleSupportedPlatforms`, `LSMinimumSystemVersion`,
+   `DTPlatformName` and friends from build settings; the repository's
+   `Info.plist` template only carries `$(...)` placeholders. A kext without
+   the platform declaration is skipped while the boot kext collection is
+   built. The script now generates a complete plist with `plistlib`.
+
+`scripts/build-local.sh` fails the build if either check regresses, because
+OpenCore skips an unusable kext silently - there is no error message to notice
+at boot time.
+
 ## 2.6.0 — 2026-11-13
 
 ### 修复：睡眠唤醒后内核 page fault（UAF）
