@@ -1,5 +1,40 @@
 # IntelBTPatcher 修改记录（Tahoe IOSource::io + 单事件注入）
 
+## 2.6.0 — 2026-11-13
+
+### 修复：睡眠唤醒后内核 page fault（UAF）
+
+症状：合盖睡眠、唤醒后约 0.8 秒出现 kernel panic，Panicked task 是 `kernel_task`：
+
+```
+trap type = 14 page fault, Fault CR2: 0x0000000000000268
+com.zxystd.IntelBTPatcher :
+  CIntelBTPatcher::newHostDeviceRequest(...) + 0x160
+ <- IOUSBHostDevice::deviceRequest <- getDescriptor <- getDeviceDescriptor
+ <- CIntelBTPatcher::captureIntelInterruptPipe + 0x40
+ <- CIntelBTPatcher::newInitPipeConfig + 0x40
+ <- AppleUSBXHCIPipe::withDescriptorsAndOwners <- IOUSBHostDevice::start
+```
+
+`+0x160` 对应 `callq *0x268(%rcx)`，`%rcx` 来自全局 `g_btDevice`，读出来是 0。
+也就是 `g_btDevice` 指向的 `IOUSBHostDevice` 已经被释放：唤醒时 USB 重新枚举，
+旧设备被销毁，钩子再往它身上写 ioreg 标记就踩到已释放内存。
+
+### 修法
+
+- `setBtDevice()`：交换前 `retain()` 新设备，交换后对旧指针 `release()`。只要我们持有引用，对象就不会被释放。
+- `btDeviceUsable()`：每次调用前校验首字段（vtable 槽）非空，双重保险。
+- `setPropData()` / `setDeviceData()`：`OSData::withBytes` 之后必须 `release()`。
+  `setProperty()` 自己持有引用，原来每次 HCI 设备请求漏掉一个内核对象。
+
+### 构建
+
+`scripts/build-local.sh`：不依赖 Xcode，单独 clang++ + MacKernelSDK + Lilu 头文件就能出 kext。
+2.6.0 产物 47520 字节，`VersionInfo = REL-260-...`（2.5.2 是 `REL-252-...`），
+`kmutil showloaded` 里可以直接区分。
+
+---
+
 修改时间：2026-11-09
 修改范围：仅本地文件；未 git commit / git push，未 SSH，未重启任何机器。
 参考实现：https://raw.githubusercontent.com/if-lensman/Hackintosh-MacPro7-1-EFI/main/patches/IntelBTPatcher/IntelBTPatcher.cpp

@@ -139,6 +139,40 @@ Works alongside `RealtekBluetoothFirmware.kext` (firmware upload) and `BlueToolF
 
 ---
 
+## Building without Xcode
+
+GitHub macOS runners can sit in the queue for a long time, and a Command Line Tools
+install has no `xcodebuild`. `scripts/build-local.sh` reproduces the kext with plain
+`clang++` + [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) + Lilu headers:
+
+```sh
+btbuild/
+  MacKernelSDK/        # git clone https://github.com/acidanthera/MacKernelSDK
+  Lilu/                # git clone https://github.com/acidanthera/Lilu
+  RealtekBTPatcher/    # this repo
+
+cd RealtekBTPatcher && ./scripts/build-local.sh 2.6.0
+# -> out/IntelBTPatcher.kext
+```
+
+Two things the script has to work around, both worth knowing if you build by hand:
+
+- **`TARGET_OS_OSX` must be 0.** MacKernelSDK ships Apple's `TargetConditionals.h`, which
+  reports `TARGET_OS_OSX == 1` on macOS. `IOKit/usb/IOUSBHostPipe.h:129` and
+  `IOKit/usb/IOUSBHostDevice.h:222` use that macro to *also* pull in the DriverKit variants
+  of the same classes, so a raw clang build dies with `redefinition of 'IOUSBHostPipe'`,
+  `redefinition of 'IOUSBHostDevice'` and `unknown type name 'IOUSBHostPipe_Methods'`.
+  The script shadows the header with a copy whose macOS branch is flipped (this is what the
+  Xcode KEXT product type effectively does implicitly).
+- **`-D` flags must not contain a space.** `-D MODULE_VERSION=2.6.0` as a single argv entry
+  makes the version silently vanish; use `-DMODULE_VERSION=2.6.0`.
+
+The `VersionInfo` ioreg property is the fastest way to confirm what you actually built —
+it reads `REL-<maj><min><patch>-<build date>`, e.g. `REL-260-2026-11-13` for 2.6.0.
+A `DBG-` prefix means `DEBUG` was defined.
+
+---
+
 ## Credits
 
 This work builds directly on the following projects and analyses. Many thanks to their authors.
