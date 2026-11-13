@@ -39,15 +39,18 @@ static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
 static bool g_armedState = false;
+static bool g_guardEnabled = false;
 
-// 2.6.1 boot guard.  The RTL8821CE's own HCI/LE init burst runs in the first
-// seconds after bluetoothd starts and is timing fragile on this platform
-// (boot window logs: "OI_HCICMD_ReadLocalVersionInformation failed: STATUS 408",
-// "Failed to read local Fast LE Connection data from controller with result:11",
-// "LE_InitMultipleAdvertising failed with status  STATUS 152",
-// "Server.LE.Scan  Failed to add rule").  Our completion wrapping and event
-// injection sit on that very path, so keep every rewrite disarmed until the
-// init burst is over.  Arming is automatic; -ibtpwrap is still required.
+// Optional boot guard, opt-in with -ibtpguard.  The RTL8821CE's own HCI/LE init
+// burst runs in the first seconds after bluetoothd starts and is timing fragile
+// on this platform (boot window logs: "OI_HCICMD_ReadLocalVersionInformation
+// failed:  STATUS 408", "Failed to read local Fast LE Connection data from
+// controller with result:11", "LE_InitMultipleAdvertising failed with status
+// STATUS 152", "Server.LE.Scan  Failed to add rule").  Measured on 2026-11-13:
+// with the guard armed (IBTPArmed=N during the whole init, IBTPUptimeMs=60078)
+// the failure is unchanged, i.e. it is NOT caused by these wrappers but by the
+// controller/firmware bring-up, so the guard stays off by default and exists
+// only as a diagnostic switch.
 #ifndef IBTP_ARM_DELAY_MS
 #define IBTP_ARM_DELAY_MS 60000
 #endif
@@ -63,6 +66,8 @@ static bool wrapArmed()
 {
     if (!g_wrapEnabled)
         return false;
+    if (!g_guardEnabled)
+        return true;
     return ibtpUptimeMs() >= (uint32_t)IBTP_ARM_DELAY_MS;
 }
 
@@ -127,6 +132,7 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 bool CIntelBTPatcher::init()
 {
     g_wrapEnabled = checkKernelArgument("-ibtpwrap");
+    g_guardEnabled = checkKernelArgument("-ibtpguard");
     IOLog("IntelBTPatcher: init() called, kernel=%d\n", (int)getKernelVersion());
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
