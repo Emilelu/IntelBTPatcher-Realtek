@@ -1,5 +1,49 @@
 # IntelBTPatcher 修改记录（Tahoe IOSource::io + 单事件注入）
 
+### 2.6.1 - boot-time controller race is not ours
+
+Two hypotheses for "the keyboard only reconnects after toggling Bluetooth once"
+were tested on 2026-11-13.
+
+Findings from the boot window (macOS 26.7.3, RTL8821CE `0BDA:B00A`, firmware
+v61592 c30136):
+
+```
+11:53:14.189 E OI_HCICMD_ReadLocalVersionInformation failed:  STATUS 408, but we move forward
+11:53:14.294 E Failed to read local Fast LE Connection data from controller with result:11
+11:53:14.295 E LE_InitMultipleAdvertising failed with status  STATUS 152
+11:53:14.315 E Server.LE.Scan  Failed to add rule
+11:53:14.389 Df Connect called to "82F8798D-68AF-A2E5-A994-BB08F8605055"
+```
+
+After `Connect called` there is no `Outgoing connection ... successful` and no
+`reason`; bluetoothd abandons the attempt and does not retry for hours. The
+same four error lines appear in the 2026-11-10 logs, so the race predates every
+change made here.
+
+To rule out our own hooks, 2.6.1 added `-ibtpguard`: every rewrite
+(`rewriteHciEvent` injection and the three `IOUSBHostIOSource::io` completion
+wrappers) stays disarmed until system uptime reaches `IBTP_ARM_DELAY_MS`
+(default 60 s). Verified with the guard active during the whole init burst
+(`IBTPArmed=N` through the failure, then `IBTPUptimeMs=60078` at the transition)
+and the boot-time failures were unchanged, byte for byte.
+
+Conclusion: the failed bring-up belongs to the controller/firmware, not to these
+wrappers, so the guard is opt-in only (`-ibtpguard`) and behaviour without it is
+identical to 2.6.0. What stays from 2.6.1 is the ioreg write throttle inside the
+hooks: `IBTPIOSourceHits` is published on every 64th pass while unarmed and on
+state transitions, instead of allocating an `OSData` for every HCI event.
+
+Practical consequence: after a cold boot the keyboard may need one manual
+Bluetooth off/on in System Settings. That toggle performs a real controller
+power cycle; no CLI equivalent exists on Tahoe
+(`IOBluetoothPreferenceSetControllerPowerState` is a stub returning 0,
+`pkill bluetoothd` / `launchctl kickstart` restart the daemon without
+re-initialising the controller, and `USBDeviceReEnumerate` returns
+`0xE00002CD`). Do not use `defaults write /Library/Preferences/com.apple.Bluetooth
+ControllerPowerState 0` to emulate it: it powers the radio off and cannot be
+undone without a reboot.
+
 ### Local (Xcode-free) build: two things the linker no longer does
 
 Building with `scripts/build-local.sh` produced a bundle that OpenCore
