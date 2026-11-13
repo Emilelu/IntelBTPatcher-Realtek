@@ -111,3 +111,24 @@ Windows 侧一键工具：`D:\Files\System\Windows\Utilities\VNC\修复蓝牙.ba
 
 - **A（推荐，根治）** 换 Apple 原生支持的 BCM20702 芯片 USB 蓝牙（华硕 USB-BT400 等，¥50–100），走原生 USB 传输，不经过 DriverKit 串口，也不依赖这颗 Realtek 芯片的私有固件路径。
 - **B** 维持现状，保留开机自动踢一次 + Windows 侧手动按钮。
+
+## 8. 最终结论（2026-11-13 13:05 实测，已推翻「Mac 端 bug」）
+
+用户说明：**这把键盘平时连的是另一台电脑**。随后日志给出了决定性证据：
+
+```
+13:05:08.450 Outgoing connection to device "82F8798D-…" (Random D3:0C:D1:FA:CA:CA)
+             was successful with connection interval 24 active=1
+13:05:10.112 Le topology - {… state: CONNECTED, ready-state: LE_READY_IDLE, enc-state: ON …}
+13:05:34.849 LE Link disconnected for handle 0x114b04c10 … with reason 719 encryptionPending 0
+```
+
+即：**Mac 自己能在 2 秒内完成连接、加密、状态机走到 IDLE**（这就是用户看到的「刚才键盘自动连上了」），24 秒后又以 `reason 719` 断开（键盘切回另一台电脑）。
+
+结论：
+
+1. **不是 Mac 端的 bug，也不是 IntelBTPatcher 的问题。** Mac 侧的自动重连、EDL 注入、配对加密都正常。
+2. 「开机后不自动连」的真实原因是这把键盘是**多主机 BLE 键盘**，同一时刻只服务一台主机；空闲时不广播，只在按键/切换主机时广播。开机那一刻它还连着另一台电脑，Mac 就连不上——这是**偶发**的根源。
+3. 四条 HCI 初始化错误（STATUS 408 / result:11 / STATUS 152 / Failed to add rule）是这颗 Realtek 芯片在 Tahoe 上的**常态噪声**，连接成功的日志里同样存在，不要当成故障指标。
+
+因此：**开机自动踢蓝牙的 LaunchDaemon 已移除**（留着只会在键盘连在别的电脑时白白抢一次连接），`修复蓝牙.bat` 作为手动强制重连工具保留。
