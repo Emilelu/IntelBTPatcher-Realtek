@@ -9,6 +9,9 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
 
+#include <kern/clock.h>
+#include <mach/mach_time.h>
+
 #include "IntelBTPatcher.hpp"
 
 static CIntelBTPatcher ibtPatcher;
@@ -35,6 +38,33 @@ static bool g_wrapEnabled = false;   // only with -ibtpwrap: actually rewrite/wr
 static int g_hciCmdCount = 0;
 static unsigned int g_lastBm = 0;
 static unsigned int g_lastReq = 0;
+static bool g_armedState = false;
+
+// 2.6.1 boot guard.  The RTL8821CE's own HCI/LE init burst runs in the first
+// seconds after bluetoothd starts and is timing fragile on this platform
+// (boot window logs: "OI_HCICMD_ReadLocalVersionInformation failed: STATUS 408",
+// "Failed to read local Fast LE Connection data from controller with result:11",
+// "LE_InitMultipleAdvertising failed with status  STATUS 152",
+// "Server.LE.Scan  Failed to add rule").  Our completion wrapping and event
+// injection sit on that very path, so keep every rewrite disarmed until the
+// init burst is over.  Arming is automatic; -ibtpwrap is still required.
+#ifndef IBTP_ARM_DELAY_MS
+#define IBTP_ARM_DELAY_MS 60000
+#endif
+
+static uint32_t ibtpUptimeMs()
+{
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return (uint32_t)(ns / 1000000ULL);
+}
+
+static bool wrapArmed()
+{
+    if (!g_wrapEnabled)
+        return false;
+    return ibtpUptimeMs() >= (uint32_t)IBTP_ARM_DELAY_MS;
+}
 
 static const char *bootargOff[] {
     "-ibtcompatoff"
@@ -496,7 +526,7 @@ static void rewriteHciEvent(IOMemoryDescriptor *dataBuffer, uint32_t &bytesTrans
         // Single-event injection: append the fake LE Data Length Change right
         // after the first real LE Read Remote Features Complete. Handle bytes
         // are copied from the real event (data[2] = lo, data[3] = hi).
-        if (g_wrapEnabled && hdrComplete && hdr->evt == HCI_EVT_LE_META && hdr->len >= 4 &&
+        if (wrapArmed() && hdrComplete && hdr->evt == HCI_EVT_LE_META && hdr->len >= 4 &&
             hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE &&
             g_leMetaStage == 0) {
             g_leMetaStage = 1;
@@ -585,7 +615,7 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
     // On Tahoe, IOUSBHostPipe::io tail-jumps into IOUSBHostIOSource::io, which
     // is hooked below. Wrapping here as well would wrap the same completion
     // twice, so only do it when the IOSource::io(Completion) route is absent.
-    if (g_wrapEnabled && !_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
+    if (wrapArmed() && !_iosSourceCompletionRouted && remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         interceptedAsyncCount++;
         setDeviceData("IBTPAsyncHit", "Y", 1);
         AsyncOwnerData *ownerData = new AsyncOwnerData();
@@ -609,10 +639,20 @@ newIOSourceIOCompletion(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dat
 {
     if (isHookedIOSource(that)) {
         g_iosSourceHits++;
-        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
-        setDeviceData("IBTPWrapEnabled", g_wrapEnabled ? "Y" : "N", 1);
+        const bool armed = wrapArmed();
+        if (armed != g_armedState) {
+            g_armedState = armed;
+            publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+            setDeviceData("IBTPWrapEnabled", g_wrapEnabled ? "Y" : "N", 1);
+            setDeviceData("IBTPArmed", armed ? "Y" : "N", 1);
+            char ub[16];
+            snprintf(ub, sizeof(ub), "%u", (unsigned int)ibtpUptimeMs());
+            setDeviceData("IBTPUptimeMs", ub, (unsigned int)strlen(ub));
+        } else if ((g_iosSourceHits & 0x3F) == 0) {
+            publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+        }
     }
-    if (g_wrapEnabled && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+    if (wrapArmed() && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = completion->action;
         ownerData->bundledAction = nullptr;
@@ -634,10 +674,11 @@ newIOSourceIORjj(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBuffer
 {
     if (isHookedIOSource(that)) {
         g_iosSourceHits++;
-        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+        if ((g_iosSourceHits & 0x3F) == 0)
+            publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
     }
     IOReturn ret = FunctionCast(newIOSourceIORjj, callbackIBTPatcher->oldIOSourceIORjj)(that, dataBuffer, dataBufferLength, bytesTransferred, completionTimeoutMs);
-    if (g_wrapEnabled && ret == kIOReturnSuccess && remoteReadSCount > 0 && isHookedIOSource(that))
+    if (wrapArmed() && ret == kIOReturnSuccess && remoteReadSCount > 0 && isHookedIOSource(that))
         rewriteHciEvent(dataBuffer, bytesTransferred);
     return ret;
 }
@@ -647,9 +688,10 @@ newIOSourceIOBundled(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBu
 {
     if (isHookedIOSource(that)) {
         g_iosSourceHits++;
-        publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
+        if ((g_iosSourceHits & 0x3F) == 0)
+            publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
     }
-    if (g_wrapEnabled && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
+    if (wrapArmed() && isHookedIOSource(that) && remoteReadSCount > 0 && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData();
         ownerData->action = nullptr;
         ownerData->bundledAction = completion->action;
@@ -695,6 +737,15 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
             publishDeviceInt("IBTPIOSourceHits", g_iosSourceHits);
             publishDeviceInt("IBTPInjected", g_injected);
             publishDeviceInt("IBTPEDLClear", g_edlCleared);
+            setPropData(device, "IBTPWrapEnabled", g_wrapEnabled ? "Y" : "N", 1);
+            {
+                const bool armed = wrapArmed();
+                g_armedState = armed;
+                setPropData(device, "IBTPArmed", armed ? "Y" : "N", 1);
+                char ub[16];
+                snprintf(ub, sizeof(ub), "%u", (unsigned int)ibtpUptimeMs());
+                setPropData(device, "IBTPUptimeMs", ub, (unsigned int)strlen(ub));
+            }
             if (device->getProperty("IBTPHandle") == nullptr)
                 publishDeviceString("IBTPHandle", "none");
             if (device->getProperty("IBTPPipeCaptured") == nullptr) {
