@@ -207,6 +207,47 @@ hpp 中的对应声明与成员：
 - 未 SSH
 - 未重启任何机器
 
+### 2026-11-15 - fix for the bluetoothd SIGBUS: decompress the file
+
+Follow-up to the entry below. The "corrupt bytes" were our own patch (see
+below), but the *crash* was real: bluetoothd is an APFS-compressed (`decmpfs`)
+binary, so once a page has been rewritten by BlueToolFixup, a later fault on that
+page has to be re-derived from the compressed stream, the bytes no longer match
+the recorded per-chunk hash, the fault fails and the process takes `SIGBUS`.
+
+Fix: remove the compression flag from the file, so there is no hash to mismatch.
+
+```sh
+sudo umount "/Volumes/Macintosh HD 1"
+sudo mount -o nobrowse -t apfs /dev/disk1s4 /System/Volumes/Update/mnt1
+sudo mount -uw /System/Volumes/Update/mnt1
+sudo chflags nocompressed /System/Volumes/Update/mnt1/usr/sbin/bluetoothd
+sudo bless --mount /System/Volumes/Update/mnt1 --bootefi --create-snapshot
+sudo reboot
+```
+
+Measured, 58 minutes after booting the new snapshot:
+
+| | before | after |
+| --- | --- | --- |
+| `ls -lO` flags | `restricted,compressed` | `restricted` |
+| bluetoothd SIGBUS crashes | 3 on 11-14 evening | **0** |
+| real `apfs_announce_hash_mismatch` | 10 on 11-14, 32 on 11-10 | **0** |
+| controller | `attrib_on / v61592 c30136` | `attrib_on / v61592 c30136` |
+| encrypted connections | worked | 2, still works |
+
+The patched bytes remain in the file and `codesign -v` still fails — that part is
+expected and harmless. Only the hash-verified decompression path is gone.
+
+Added `tools/bt-recovery/bt-decomp-track.py` +
+`com.local.btdecomp.track.plist`: samples `decomp=yes|NO`, the real mismatch
+count, and the crash-report count every 15 minutes into
+`/var/log/bt-decomp-fix.log`. **A macOS update can re-compress or replace
+bluetoothd and silently undo this fix**; the tracker makes that visible instead
+of letting Bluetooth die days later.
+
+See `docs/bluetoothd-Code-Page-Corruption.md` §4 and §7.
+
 ### 2026-11-15 - "corrupt bluetoothd" was our own `-btlfxa2dpcheck` page patch
 
 **This corrects the 2026-11-14 entry below.** That entry concluded the machine

@@ -16,17 +16,17 @@ picture as a missing dongle — while the USB device is present and healthy.
 
 ---
 
-## 1. The three distinct symptoms (do not conflate them)
+## 1. The four distinct symptoms (do not conflate them)
 
 | # | Symptom | Real cause | Status |
 | --- | --- | --- | --- |
 | A | `codesign -v /usr/sbin/bluetoothd` fails, file sha256 differs from Apple's | BlueToolFixup rewrites `__TEXT` pages at run time (§2, §3) | **Expected.** Not a fault. |
-| B | `bluetoothd` dies with `EXC_BAD_ACCESS (SIGBUS)` on its own `__TEXT` | A patched page could not be faulted back in (§4) | Intermittent, under investigation |
-| C | Bluetooth dead: `State: Off`, `BCM_4350C2`, `v0 c0` | NVRAM pinning `bluetoothExternalDongleFailed %01` + bluetoothd crash-loop (§5) | Mitigated by watchdog (§7) |
-| D | BLE keyboard won't connect, AirPods do | Keyboard does not advertise while idle; boot-time race (§6) | Known, not a Mac bug |
+| B | `bluetoothd` dies with `EXC_BAD_ACCESS (SIGBUS)` on its own `__TEXT` | A patched page could not be re-derived from the APFS-compressed stream (§4) | **Fixed** by `chflags nocompressed` (§4) |
+| C | Bluetooth dead: `State: Off`, `BCM_4350C2`, `v0 c0` | NVRAM pinning `bluetoothExternalDongleFailed %01` + bluetoothd crash-loop (§6) | Mitigated by watchdog (§7) |
+| D | BLE keyboard won't connect, AirPods do | Keyboard does not advertise while idle; boot-time race (§6b) | Known, not a Mac bug |
 
-A is normal and harmless. B and C are what actually breaks Bluetooth. D is a
-separate, older issue.
+A is normal and harmless. B is fixed. C is mitigated. D is a separate, older
+issue.
 
 ## 2. What BlueToolFixup does to bluetoothd
 
@@ -99,9 +99,9 @@ Supporting evidence:
   bytes: a different vnode means a different page-cache entry that the patcher
   never touched. This is what made it look like "one view is corrupt".
 
-## 4. Why it still crashes (symptom B)
+## 4. Why it still crashes (symptom B) — and the fix
 
-`bluetoothd` occasionally dies with:
+`bluetoothd` occasionally died with:
 
 ```
 EXC_BAD_ACCESS (SIGBUS) KERN_MEMORY_ERROR
@@ -109,7 +109,7 @@ EXC_BAD_ACCESS (SIGBUS) KERN_MEMORY_ERROR
 ```
 
 `SIGBUS` on a code page means the page could not be faulted back in. The kernel
-reports a companion APFS error:
+reported a companion APFS error:
 
 ```
 apfs_announce_hash_mismatch:154: disk1s4 Data hash mismatch for 16384 bytes at offset 1982464
@@ -119,15 +119,54 @@ apfs_announce_hash_mismatch:154: disk1s4 Data hash mismatch for 16384 bytes at o
 bluetoothd is an APFS-compressed (`decmpfs`) binary. After the patcher has
 rewritten a cached page, a later fault on that page has to be re-served from the
 compressed stream; the decompressed bytes no longer match the recorded hash, so
-the fault fails and the process takes a `SIGBUS`.
+the fault fails and the process takes a `SIGBUS`. **The compression is the
+enabler** — the patched bytes themselves are harmless as long as nothing has to
+re-derive them from a hash-checked stream.
 
-Ten such crashes exist, on **2026-11-10 (7×)** and **2026-11-14 (3×)**. The
-11-10 ones predate `-btlfxa2dpcheck` (added 11-12), but BlueToolFixup's other
-patches (chipset/boardId/NVRAM checks) have always been active, so the mechanism
-is the same. This is a genuine interaction between an in-place code patcher and
-a compressed, sealed system binary — not media failure.
+### The fix: decompress the file
 
-Ruled out along the way, with tests:
+Removing the APFS compression flag on `/usr/sbin/bluetoothd` removes the hash
+check that the patch trips over:
+
+```sh
+sudo diskutil mount disk0s1                     # ESP, for config work only
+sudo umount "/Volumes/Macintosh HD 1"
+sudo mount -o nobrowse -t apfs /dev/disk1s4 /System/Volumes/Update/mnt1
+sudo mount -uw /System/Volumes/Update/mnt1
+
+F=/System/Volumes/Update/mnt1/usr/sbin/bluetoothd
+sudo chflags nocompressed "$F"
+sudo xattr -d com.apple.decmpfs "$F" 2>/dev/null    # may already be gone
+
+sudo bless --mount /System/Volumes/Update/mnt1 --bootefi --create-snapshot
+sudo reboot
+```
+
+`chflags nocompressed` makes APFS store the file uncompressed; the decmpfs
+attribute disappears and so does the per-chunk hash. The file keeps its
+`restricted` flag and its size (23555568 bytes), and it still carries the
+patcher's bytes — but nothing re-verifies them against a stored hash any more.
+
+### Measured result
+
+| | before (compressed) | after (`nocompressed`) |
+| --- | --- | --- |
+| `ls -lO` flags | `restricted,compressed` | `restricted` |
+| crashes in 58 min | 3 on 11-14 evening | **0** |
+| real `apfs_announce_hash_mismatch` | 10 on 11-14, 32 on 11-10 | **0** |
+| `-25291` keychain noise | present | 15 (still present, still harmless) |
+| encrypted connections | worked | 2 (still works) |
+| controller | `attrib_on / v61592 c30136` | `attrib_on / v61592 c30136` |
+
+The `codesign -v` failure remains, of course — the patch still rewrites the
+pages. That is symptom A, which is expected and harmless.
+
+**Caveat:** a macOS update can reinstall or re-compress `bluetoothd`, silently
+undoing this. That is what `bt-decomp-track.py` (§7) is for: it samples
+`decomp=yes|NO` and the real mismatch count every 15 minutes, so a regression
+shows up as a log line rather than as a dead Bluetooth stack days later.
+
+## 5. What was ruled out on the way
 
 | Hypothesis | Test | Result |
 | --- | --- | --- |
@@ -137,8 +176,9 @@ Ruled out along the way, with tests:
 | Stale snapshot | rewrote file on live volume, new snapshot, re-bless, reboot | still "bad" — because bluetoothd patched it again |
 | APFS/decmpfs on disk | mount live volume rw, hash the file there | always GOOD |
 | `AirPortRTW` 1.2.1 | crash census vs install date | exonerated (crashes exist on 11-10, install was 11-14) |
+| Our kexts generally | crash-type census of all 51 reports | `EXC_BAD_ACCESS` only on 11-10 (7×) and 11-14 (3×); 11-10 predates the WiFi update |
 
-## 5. Symptom C: NVRAM pinning
+## 6. Symptom C: NVRAM pinning
 
 Even with a healthy bluetoothd, Bluetooth can stay dead because macOS writes
 
@@ -158,7 +198,7 @@ State: On | Chipset: THIRD_PARTY_DONGLE | DC:F5:05:FF:E4:02 | v61592 c30136
 `NVRAM → Add`, so they are reset at boot — but macOS re-writes `%01` at runtime,
 so a boot-time fix alone is not enough. This is why the watchdog exists.
 
-## 6. Symptom D: the keyboard, and why `-25291` is a red herring
+## 6b. Symptom D: the keyboard, and why `-25291` is a red herring
 
 `bluetoothd` logs
 
@@ -186,9 +226,11 @@ block pairing. What actually blocks the keyboard:
 2. a boot-time race: macOS tries to reconnect before the controller's LE
    subsystem is up, and does not retry.
 
-## 7. Mitigation in place
+## 7. Two daemons now in place
 
-`btpurge-watch.sh` (v3), installed as `/usr/local/bin/btpurge-watch.sh` +
+### `btpurge-watch.sh` (v3) — recovers a dead Bluetooth stack
+
+Installed as `/usr/local/bin/btpurge-watch.sh` +
 `/Library/LaunchDaemons/com.local.btpurge.watch.plist` (`RunAtLoad`,
 `StartInterval=60`):
 
@@ -211,15 +253,34 @@ Observed working:
 
 `--probe` prints the current state without touching anything.
 
+### `bt-decomp-track.py` — guards the §4 fix from being silently undone
+
+Installed as `/usr/local/bin/bt-decomp-track.py` +
+`/Library/LaunchDaemons/com.local.btdecomp.track.plist` (`RunAtLoad`,
+`StartInterval=900`). Every 15 minutes it appends one line to
+`/var/log/bt-decomp-fix.log`:
+
+```
+2026-11-15 00:24:57 decomp=yes crashes=63 newest=… mismatch=0 bt=attrib_on|v61592 c30136|DC:F5:05:FF:E4:02
+```
+
+- `decomp=yes|NO` — is `/usr/sbin/bluetoothd` still free of the `compressed` flag?
+- `mismatch=N` — real `apfs_announce_hash_mismatch` events since boot (our own
+  `log show` invocations are filtered out).
+- `crashes=N newest=…` — crash-report count and newest file.
+
+This matters because **a macOS update can re-compress or replace the file**,
+which silently reinstates symptom B. The tracker turns that into a visible log
+line instead of a dead Bluetooth stack days later. `--show` prints the history.
+
 ## 8. What is genuinely left
 
-- **Symptom B** (the SIGBUS crash) is an inherent hazard of patching a sealed,
-  compressed system binary in place. Eliminating it means changing how
-  BlueToolFixup applies the A2DP gate — e.g. patching a non-`__TEXT` site, or
-  hooking the function instead of rewriting its bytes. That is real work with
-  real risk, and it trades against AirPods audio stability.
 - **Symptom D** is best solved on the keyboard side (press a key when pairing
   is attempted) or by accepting the watchdog.
+- A more robust alternative to §4 would be to stop patching `__TEXT` at all —
+  hook the function rather than rewriting its bytes — but that is real work with
+  real risk, and it trades against AirPods audio stability. Decompressing the
+  file achieves the same outcome for one `chflags` and no kext changes.
 - An Apple-native BCM20702 dongle (e.g. ASUS USB-BT400) sidesteps the Realtek
   DriverKit serial path entirely, but would still be subject to BlueToolFixup
   patching if that kext is kept.
