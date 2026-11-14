@@ -206,3 +206,34 @@ hpp 中的对应声明与成员：
 - 未 `git push`
 - 未 SSH
 - 未重启任何机器
+
+### 2026-11-14 - bluetoothd code-page corruption is not a kext bug
+
+Investigated a Bluetooth outage where the controller reported
+`State: Off / BCM_4350C2 / Address NULL / v0 c0` while the USB dongle was
+present. Root cause is a data-integrity fault on `/usr/sbin/bluetoothd`'s
+`__TEXT` pages in the sealed boot snapshot's read path, not this kext:
+
+- crash is `EXC_BAD_ACCESS (SIGBUS)` / `KERN_MEMORY_ERROR`, address inside
+  bluetoothd `__TEXT`; APFS logs `apfs_announce_hash_mismatch` for the same inode;
+- same inode reads GOOD from the live volume, BAD from the boot snapshot;
+  the bad bytes move between boots and after `purge`;
+- 343 system binaries scanned, bluetoothd is the only real Mach-O that fails
+  `codesign -v`;
+- `EXC_BAD_ACCESS` occurrences: 2026-11-10 (7x) and 2026-11-14 (3x) only. On
+  11-10 AirPortRTW was still 1.2.0, so the WiFi update is exonerated;
+- 12 GB x 3 rounds RAM test: 0 mismatches; NVMe error/retry counters all 0;
+- rewriting the file on the live volume + new snapshot + re-bless + reboot did
+  not fix the boot copy;
+- overriding launchd to run a good copy from `/usr/local` fails: the process
+  crash-loops and cannot talk to `secd`.
+
+Second, independent failure mode: macOS writes `bluetoothExternalDongleFailed
+%01` at runtime, which pins Bluetooth off even with a healthy bluetoothd.
+`config.plist` resets it at boot but macOS re-writes it.
+
+Mitigation: `tools/bt-recovery/btpurge-watch.sh` (v3) - resets the two NVRAM
+variables, purges, kickstarts bluetoothd, verifies, retries once, 300 s
+cooldown. Two automatic recoveries observed in one evening.
+
+See `docs/bluetoothd-Code-Page-Corruption.md`.
