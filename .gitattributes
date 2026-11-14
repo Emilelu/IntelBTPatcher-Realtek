@@ -5,6 +5,7 @@
 *.plist.bak-* -text
 *.cpp text eol=lf
 *.hpp text eol=lf
+*.py text eol=lf
 *.md text eol=lf
 *.png binary
 *.zip binary
