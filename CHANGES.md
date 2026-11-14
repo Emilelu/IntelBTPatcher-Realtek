@@ -207,30 +207,81 @@ hpp 中的对应声明与成员：
 - 未 SSH
 - 未重启任何机器
 
-### 2026-11-14 - bluetoothd code-page corruption is not a kext bug
+### 2026-11-15 - "corrupt bluetoothd" was our own `-btlfxa2dpcheck` page patch
+
+**This corrects the 2026-11-14 entry below.** That entry concluded the machine
+had an APFS/SSD data-integrity fault and suggested reinstalling macOS or
+replacing the SSD. That was wrong.
+
+The eleven "corrupt" bytes in `/usr/sbin/bluetoothd` are written at run time by
+BlueToolFixup's `_cs_validate_page` route when `-btlfxa2dpcheck` is set: an
+8-byte NOP sled at `0x1e7bb7` and the A2DP gate `45 85 f6 74 25` →
+`45 31 f6 eb 25` at `0x45c13e`. They are valid x86, not bit rot.
+
+Decisive test — toggle only the daemon:
+
+```
+launchctl bootout system/com.apple.bluetoothd ; purge ; shasum
+    -> GOOD  579bb5f5…
+launchctl kickstart -k system/com.apple.bluetoothd ; shasum
+    -> BAD   c31f8ff4…
+```
+
+The bytes follow the process, so the process is the author. The file's other
+vnode (`/System/Volumes/Update/mnt1/usr/sbin/bluetoothd`) has its own page cache
+entry and is never patched, which is why it always hashed clean and made this
+look like "one view is corrupt".
+
+Consequences:
+
+- `codesign -v /usr/sbin/bluetoothd` failing is **expected** while
+  `-btlfxa2dpcheck` is active. Do not treat it as a fault.
+- `-btlfxa2dpcheck` must stay: without it the user's AirPods audio breaks up.
+- The occasional `EXC_BAD_ACCESS (SIGBUS)` on a bluetoothd code page is a real
+  hazard of patching a compressed sealed binary in place: after the page is
+  rewritten, a later fault re-decompresses from the APFS stream, the hash no
+  longer matches, and the fault fails. Fixing it means changing *where* the
+  A2DP gate is applied, not reinstalling macOS.
+- `-25291` keychain failures are background noise on this Realtek/Tahoe pair,
+  not the cause of keyboard failures: one boot had 523 of them **and** 7
+  successful `Encryption is now enabled`.
+
+The watchdog (`tools/bt-recovery/btpurge-watch.sh` v3) judges health by
+controller state only, never by hashing bluetoothd — a hash check would fire
+every 60 s forever for the reason above.
+
+See `docs/bluetoothd-Code-Page-Corruption.md` (rewritten, with a §9 recording
+why the first analysis went astray).
+
+### 2026-11-14 - bluetoothd crash-loop investigation (conclusion retracted)
 
 Investigated a Bluetooth outage where the controller reported
 `State: Off / BCM_4350C2 / Address NULL / v0 c0` while the USB dongle was
-present. Root cause is a data-integrity fault on `/usr/sbin/bluetoothd`'s
-`__TEXT` pages in the sealed boot snapshot's read path, not this kext:
+present.
 
-- crash is `EXC_BAD_ACCESS (SIGBUS)` / `KERN_MEMORY_ERROR`, address inside
-  bluetoothd `__TEXT`; APFS logs `apfs_announce_hash_mismatch` for the same inode;
-- same inode reads GOOD from the live volume, BAD from the boot snapshot;
-  the bad bytes move between boots and after `purge`;
+What survives from this investigation:
+
+- the crash is `EXC_BAD_ACCESS (SIGBUS)` / `KERN_MEMORY_ERROR` with the address
+  inside bluetoothd `__TEXT`, and APFS logs `apfs_announce_hash_mismatch` for
+  the same inode;
 - 343 system binaries scanned, bluetoothd is the only real Mach-O that fails
-  `codesign -v`;
-- `EXC_BAD_ACCESS` occurrences: 2026-11-10 (7x) and 2026-11-14 (3x) only. On
-  11-10 AirPortRTW was still 1.2.0, so the WiFi update is exonerated;
+  `codesign -v` — because it is the only one this kext patches;
+- `EXC_BAD_ACCESS` occurrences: 2026-11-10 (7x) and 2026-11-14 (3x). On 11-10
+  AirPortRTW was still 1.2.0, so the WiFi update is exonerated;
 - 12 GB x 3 rounds RAM test: 0 mismatches; NVMe error/retry counters all 0;
-- rewriting the file on the live volume + new snapshot + re-bless + reboot did
-  not fix the boot copy;
 - overriding launchd to run a good copy from `/usr/local` fails: the process
-  crash-loops and cannot talk to `secd`.
+  crash-loops and cannot talk to `secd`. Do not retry;
+- `mount_apfs -s <name>` silently falls back to the live volume when the
+  snapshot name does not resolve, so snapshot hash checks obtained that way are
+  worthless.
 
-Second, independent failure mode: macOS writes `bluetoothExternalDongleFailed
-%01` at runtime, which pins Bluetooth off even with a healthy bluetoothd.
-`config.plist` resets it at boot but macOS re-writes it.
+What was retracted: the claim that the disk/APFS was corrupting data, and the
+advice to reinstall macOS or replace the SSD.
+
+Second, independent failure mode (this part stands): macOS writes
+`bluetoothExternalDongleFailed %01` at runtime, which pins Bluetooth off even
+with a healthy bluetoothd. `config.plist` resets it at boot but macOS re-writes
+it.
 
 Mitigation: `tools/bt-recovery/btpurge-watch.sh` (v3) - resets the two NVRAM
 variables, purges, kickstarts bluetoothd, verifies, retries once, 300 s

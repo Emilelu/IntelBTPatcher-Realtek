@@ -1,116 +1,144 @@
-# bluetoothd crash-loop: corrupted `__TEXT` pages on the sealed boot snapshot
+# bluetoothd crash-loop: it was our own `-btlfxa2dpcheck` page patch all along
 
-**Date:** 2026-11-14
+**Date:** 2026-11-14 (corrected 2026-11-15)
 **Machine:** HP 15s-dy0xxx / i7-8565U / macOS Tahoe 26.7.3 (25G342) / Darwin 25.6.0
 **Symptom:** Bluetooth suddenly dies. `system_profiler SPBluetoothDataType` reports
 `State: Off`, `Chipset: BCM_4350C2`, `Address: NULL`, `Firmware: v0 c0` — the same
 picture as a missing dongle — while the USB device is present and healthy.
 
-**TL;DR — this is not a kext bug, and not our patcher.** It is a data-integrity
-fault in the read path of one system binary, `/usr/sbin/bluetoothd`, on this
-machine. Everything in this repository is exonerated by the timeline evidence
-below. Mitigation is a watchdog that resets NVRAM + purges + restarts bluetoothd.
+> **Correction notice.** The first version of this document (2026-11-14)
+> concluded that this was an APFS/SSD data-integrity fault in the read path of
+> `/usr/sbin/bluetoothd`, and recommended reinstalling macOS or replacing the
+> SSD. **That conclusion was wrong.** The "corrupted" bytes are our own
+> BlueToolFixup `-btlfxa2dpcheck` patch, written into bluetoothd's `__TEXT`
+> pages at run time. §3 below records the experiment that proves it, and §9
+> records why the earlier reasoning went astray, so nobody repeats it.
 
 ---
 
-## 1. What actually crashes
+## 1. The three distinct symptoms (do not conflate them)
 
-`bluetoothd` dies with `EXC_BAD_ACCESS (SIGBUS)` + `KERN_MEMORY_ERROR`, and the
-faulting address always lands inside bluetoothd's own `__TEXT`:
+| # | Symptom | Real cause | Status |
+| --- | --- | --- | --- |
+| A | `codesign -v /usr/sbin/bluetoothd` fails, file sha256 differs from Apple's | BlueToolFixup rewrites `__TEXT` pages at run time (§2, §3) | **Expected.** Not a fault. |
+| B | `bluetoothd` dies with `EXC_BAD_ACCESS (SIGBUS)` on its own `__TEXT` | A patched page could not be faulted back in (§4) | Intermittent, under investigation |
+| C | Bluetooth dead: `State: Off`, `BCM_4350C2`, `v0 c0` | NVRAM pinning `bluetoothExternalDongleFailed %01` + bluetoothd crash-loop (§5) | Mitigated by watchdog (§7) |
+| D | BLE keyboard won't connect, AirPods do | Keyboard does not advertise while idle; boot-time race (§6) | Known, not a Mac bug |
+
+A is normal and harmless. B and C are what actually breaks Bluetooth. D is a
+separate, older issue.
+
+## 2. What BlueToolFixup does to bluetoothd
+
+`BrcmPatchRAM/BlueToolFixup.cpp` routes `_cs_validate_page` and, for
+`/usr/sbin/bluetoothd` only, rewrites code pages in place before the kernel
+validates them:
+
+```cpp
+KernelPatcher::RouteRequest csRoute =
+    KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
+patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1);
+```
+
+Inside `patched_cs_validate_page` the page is searched for known byte patterns
+(vendor check, bad-chipset check, NVRAM check, boardId, address check, and the
+A2DP gate) and patched. The A2DP gate alone is:
 
 ```
+original  45 85 F6 74 25   test r14d,r14d ; je +0x25
+patched   45 31 F6 EB 25   xor  r14d,r14d ; jmp +0x25
+```
+
+That is a deliberate, working patch: it makes bluetoothd unconditionally take
+the audio-publish path, which is what stops AirPods audio from stuttering.
+Boot-arg `-btlfxa2dpcheck` enables it. **Do not remove it** — without it the
+user's AirPods audio breaks up.
+
+Because the patch mutates the page image, the file as read back is no longer the
+signed file. `codesign -v` therefore reports
+`invalid signature (code or signature have been modified)`, and the sha256 no
+longer matches Apple's. The Apple-original hash on this machine is:
+
+```
+579bb5f53d6b26d2c9b10228df357ca783d636d8dd92c21141195de5a725f23a
+```
+
+## 3. The experiment that proves it is our patch, not the disk
+
+The file was read, hashed, and compared while toggling only the daemon:
+
+```
+launchctl bootout system/com.apple.bluetoothd ; purge ; shasum
+    -> GOOD  579bb5f5…
+launchctl kickstart -k system/com.apple.bluetoothd ; shasum
+    -> BAD   c31f8ff4…
+```
+
+The bytes are wrong **only while bluetoothd is running**, and they come back
+wrong within seconds of restarting it. Nothing was written to disk; the volume
+is read-only. So the "corruption" lives in the page cache, put there by the
+in-process patcher.
+
+Supporting evidence:
+
+- Exactly 11 bytes differ from the live-volume copy, in three spots:
+  ```
+  0x0edd1e   root=0xeb  live=0x74
+  0x1e7bb7   root=0x90×8 (NOP sled)  live=81 f9 6f 17 00 00 77 30
+  0x45c13e   root=45 31 f6 eb 25     live=45 85 f6 74 25
+  ```
+  The second and third are `searchAndPatch` results: an 8-byte NOP sled and the
+  `xor/jmp` A2DP gate. They are not random bit rot — they are valid x86.
+- Scanning every kext in `EFI/OC/Kexts` for those patterns, **BlueToolFixup is
+  the only one** that contains `81f96f17`, `4585f674`, `4531f6eb`, and
+  `6f170000`. Its strings confirm the feature:
+  `[a2dpcheck] bluetoothd Read Clock workaround enabled (fast-connect A2DP bypass)`,
+  `[a2dpcheck] patched %s in %s`.
+- Reading the same inode through the other mount
+  (`/System/Volumes/Update/mnt1/usr/sbin/bluetoothd`) always returns the clean
+  bytes: a different vnode means a different page-cache entry that the patcher
+  never touched. This is what made it look like "one view is corrupt".
+
+## 4. Why it still crashes (symptom B)
+
+`bluetoothd` occasionally dies with:
+
+```
+EXC_BAD_ACCESS (SIGBUS) KERN_MEMORY_ERROR
 0x100ded17f is in 0x100c0b000-0x1016ae000 ---> __TEXT [10.6M] r-x/r-x SM=COW /usr/sbin/bluetoothd
 ```
 
-`SIGBUS` on a code page means the page could not be faulted in — not a bad
-pointer. The kernel says so directly:
+`SIGBUS` on a code page means the page could not be faulted back in. The kernel
+reports a companion APFS error:
 
 ```
 apfs_announce_hash_mismatch:154: disk1s4 Data hash mismatch for 16384 bytes at offset 1982464
-  in compressed data stream 1152921500312575937 of inode 1152921500312575936:
-  expected 976c30cd50d177b1234ac93d11baf33ba756b289a35d9ec14171fade36a5fc56,
-  got      253f3faadef8ef1f1d236330652ea3fdc22b08c2627388551f85f74bfe5fa27d
+  in compressed data stream 1152921500312575937 of inode 1152921500312575936
 ```
 
-That is APFS itself reporting that the bytes it just produced do not match the
-hash stored on disk.
+bluetoothd is an APFS-compressed (`decmpfs`) binary. After the patcher has
+rewritten a cached page, a later fault on that page has to be re-served from the
+compressed stream; the decompressed bytes no longer match the recorded hash, so
+the fault fails and the process takes a `SIGBUS`.
 
-## 2. It is exactly one file
+Ten such crashes exist, on **2026-11-10 (7×)** and **2026-11-14 (3×)**. The
+11-10 ones predate `-btlfxa2dpcheck` (added 11-12), but BlueToolFixup's other
+patches (chipset/boardId/NVRAM checks) have always been active, so the mechanism
+is the same. This is a genuine interaction between an in-place code patcher and
+a compressed, sealed system binary — not media failure.
 
-Scanning 343 system binaries (`/usr/bin /usr/sbin /bin /sbin /usr/libexec
-/System/Library/CoreServices`, size > 1 MB) with `codesign -v`:
-
-```
-checked=343 bad=157
-```
-
-Of the 157 "bad", 156 are `.car` / `.icns` / `.loctable` resources that simply
-carry no signature (normal `codesign` noise). Exactly **one** real Mach-O fails:
-`/usr/sbin/bluetoothd`. Per-page verification against its embedded CodeDirectory:
-2885 pages, 2 bad (`[233, 483]`).
-
-## 3. The disk is fine — the *view* is not
-
-The same inode (`1152921500312575936`) read through two paths:
-
-| read path | sha256 |
-| --- | --- |
-| boot snapshot (`/usr/sbin/bluetoothd`) | **BAD** (varies per boot: `c31f8ff4…`, `5c7fd127…`) |
-| live volume (`/System/Volumes/Update/mnt1/usr/sbin/bluetoothd`) | **GOOD** `579bb5f5…` |
-
-The good hash is the signed one: `codesign -v` passes on the live copy and fails
-on the boot copy. `F_NOCACHE` reads give the same answer on both paths, so this
-is not the unified buffer cache.
-
-Critically the corruption is **not stable** — it changes between boots and even
-after `purge` (`c31f8ff4…` → `5c7fd127…`), and it is always a handful of bytes
-in the same two regions:
-
-```
-0x0edd1e   root=0xeb  live=0x74
-0x1e7bb7   root=0x90  live=0x81     <- 8 consecutive bytes replaced by 0x90
-0x45c13e   root=0x31  live=0x85
-```
-
-A disk bad block does not heal, so this is not media rot. It behaves like data
-being corrupted while it is in flight through the boot-time read path.
-
-## 4. What was tried, and what it ruled out
+Ruled out along the way, with tests:
 
 | Hypothesis | Test | Result |
 | --- | --- | --- |
-| Our kexts (`IntelBTPatcher`, `AirPortRTW`, `BlueToolFixup`) | crash-type census of all 51 reports | `EXC_BAD_ACCESS` appears on **2026-11-10** (7×) and **2026-11-14** (3×) only. On 11-10 `AirPortRTW` was still 1.2.0 — the WiFi 1.2.1 update landed 11-14 17:20, four days later. **Exonerated.** |
 | RAM | 12 GB resident, 3 rounds, pattern fill + verify | 0 mismatches |
-| SSD media | `diskutil info` SMART, NVMe error counters | `Verified`, all read/write error and retry counters 0 |
-| Page cache | `F_NOCACHE` reads, root `purge` | unchanged |
-| Stale snapshot | rewrote the file on the live volume, made a new snapshot, re-blessed, rebooted | boot copy still bad (`c31f8ff4…`) |
-| Snapshot content itself | mounted each snapshot and hashed | all mountable snapshots hash GOOD |
-| Launchd override to a good copy | `/Library/LaunchDaemons/com.apple.bluetoothd.plist` pointing at `/usr/local/libexec/bluetoothd-good` | **failed** — see §5 |
+| SSD media | `diskutil` SMART, NVMe counters | `Verified`; all read/write error and retry counters 0 |
+| Page cache | `F_NOCACHE` reads, root `purge` | purge clears it; F_NOCACHE alone does not |
+| Stale snapshot | rewrote file on live volume, new snapshot, re-bless, reboot | still "bad" — because bluetoothd patched it again |
+| APFS/decmpfs on disk | mount live volume rw, hash the file there | always GOOD |
+| `AirPortRTW` 1.2.1 | crash census vs install date | exonerated (crashes exist on 11-10, install was 11-14) |
 
-Note on §4 row "snapshot content": `mount_apfs -s <name> /dev/disk1s4 <dir>`
-appears to succeed but can resolve to the live volume instead of the snapshot,
-which makes snapshot hashing look better than reality. The only trustworthy
-observation is what the booted root reports.
-
-## 5. The launchd override does not work (do not retry)
-
-Pointing `ProgramArguments` at a byte-perfect copy (`codesign` VALID, sha256
-`579bb5f5…`) on the Data volume:
-
-- launchd accepts the plist (`launchctl print` shows `program =
-  /usr/local/libexec/bluetoothd-good`, `state = running`);
-- the process starts, prints `Bluetooth Super Server Robot Destroyer. Host
-  software version MobileBluetooth-196.5.0.5`, and can run standalone for
-  seconds without crashing;
-- **but** under launchd it crash-loops immediately (60 reports in minutes) and
-  Bluetooth is dead: `[bm3_usb][GetProductAndVendorID] -- Found USB Device :`
-  repeats every 1–2 s with no VID/PID, `Failed to talk to secd after 4
-  attempts`, `Read SDP cache version failed`.
-
-A platform binary (`Platform identifier=26`) evidently does not function when
-executed from `/usr/local`; the entitlement/signature context differs. Reverted.
-
-## 6. The second failure mode: NVRAM pinning
+## 5. Symptom C: NVRAM pinning
 
 Even with a healthy bluetoothd, Bluetooth can stay dead because macOS writes
 
@@ -119,22 +147,50 @@ bluetoothExternalDongleFailed   %01
 ```
 
 when the dongle cannot be brought up. That flag pins the failure state. Setting
-it back to `%00` (plus a 14-byte all-zero `bluetoothInternalControllerInfo`)
-and kickstarting bluetoothd restores Bluetooth **within seconds**:
+it back to `%00` (plus a 14-byte all-zero `bluetoothInternalControllerInfo`) and
+kickstarting bluetoothd restores Bluetooth **within seconds**:
 
 ```
 State: On | Chipset: THIRD_PARTY_DONGLE | DC:F5:05:FF:E4:02 | v61592 c30136
 ```
 
-`config.plist` already lists both variables under `NVRAM → Delete` *and*
-`NVRAM → Add`, so they are reset at every boot — but macOS re-writes `%01` at
-runtime, so a boot-time fix alone is not sufficient.
+`config.plist` lists both variables under `NVRAM → Delete` **and**
+`NVRAM → Add`, so they are reset at boot — but macOS re-writes `%01` at runtime,
+so a boot-time fix alone is not enough. This is why the watchdog exists.
+
+## 6. Symptom D: the keyboard, and why `-25291` is a red herring
+
+`bluetoothd` logs
+
+```
+Failed to query keychain for device Random D3:0C:D1:FA:CA:CA with result -25291
+```
+
+`-25291` is `errSecNotAvailable`. It is tempting to blame the patched binary for
+losing its keychain entitlement, but the numbers refuse that story:
+
+- this boot: **523** occurrences of `-25291` and **7** successful
+  `Encryption is now enabled` — the same daemon, the same session;
+- 2026-11-13 11:00 hour: 342 `-25291` **and** a successful encrypted keyboard
+  connection;
+- 2026-11-14 23:32:40.939: `Le topology … D3:0C:D1:FA:CA:CA` →
+  `Outgoing connection … successful` → `Encryption is now enabled`, with
+  `-btlfxa2dpcheck` active.
+
+So `-25291` is background noise on this Realtek/Tahoe combination and does not
+block pairing. What actually blocks the keyboard:
+
+1. the BLE keyboard **does not advertise while idle** — it only advertises on a
+   keypress, so if it is not advertising at the moment macOS retries, the
+   attempt fails;
+2. a boot-time race: macOS tries to reconnect before the controller's LE
+   subsystem is up, and does not retry.
 
 ## 7. Mitigation in place
 
-`btpurge-watch.sh` (v3), installed as
-`/usr/local/bin/btpurge-watch.sh` + `/Library/LaunchDaemons/com.local.btpurge.watch.plist`
-(`RunAtLoad`, `StartInterval=60`):
+`btpurge-watch.sh` (v3), installed as `/usr/local/bin/btpurge-watch.sh` +
+`/Library/LaunchDaemons/com.local.btpurge.watch.plist` (`RunAtLoad`,
+`StartInterval=60`):
 
 1. read controller state / firmware / address;
 2. healthy → exit (no action, no disconnects);
@@ -142,23 +198,51 @@ runtime, so a boot-time fix alone is not sufficient.
 4. verify; if still unhealthy, repeat once with a longer settle time;
 5. 300 s cooldown, log to `/var/log/btpurge-history.log`.
 
-Observed working: two automatic recoveries in one evening, each logged as
-`unhealthy … ->nvram+purge+kickstart` followed by
-`pass1: attrib_on|v61592 c30136|DC:F5:05:FF:E4:02`.
+**It deliberately does not hash-check bluetoothd.** An earlier version did, and
+would have fired every 60 seconds forever, because a running bluetoothd always
+looks "corrupt" (§3). Health is judged only by controller state.
+
+Observed working:
+
+```
+2026-11-14 23:18:38 unhealthy state=attrib_off fw=v0 c0 addr=NULL ->nvram+purge+kickstart
+2026-11-14 23:19:03 pass1: attrib_on|v61592 c30136|DC:F5:05:FF:E4:02
+```
 
 `--probe` prints the current state without touching anything.
 
-## 8. If it keeps happening
+## 8. What is genuinely left
 
-The remaining candidates are all below the configuration layer:
+- **Symptom B** (the SIGBUS crash) is an inherent hazard of patching a sealed,
+  compressed system binary in place. Eliminating it means changing how
+  BlueToolFixup applies the A2DP gate — e.g. patching a non-`__TEXT` site, or
+  hooking the function instead of rewriting its bytes. That is real work with
+  real risk, and it trades against AirPods audio stability.
+- **Symptom D** is best solved on the keyboard side (press a key when pairing
+  is attempted) or by accepting the watchdog.
+- An Apple-native BCM20702 dongle (e.g. ASUS USB-BT400) sidesteps the Realtek
+  DriverKit serial path entirely, but would still be subject to BlueToolFixup
+  patching if that kext is kept.
 
-- reinstall macOS (recreates the sealed snapshot from scratch — the official
-  remedy for `APFSUserAgent`'s "Volume Hash Mismatch" dialog);
-- replace the SSD, since a fault that corrupts data in flight but never trips a
-  media error counter is characteristic of controller/firmware-level problems;
-- or accept the watchdog, which recovers in under a minute.
+## 9. Why the first version of this document was wrong
 
-An external USB Bluetooth dongle with an Apple-native chipset (BCM20702, e.g.
-ASUS USB-BT400) also sidesteps the issue entirely — it does not depend on
-bluetoothd's `__TEXT` pages being intact any more than any other process does,
-but it removes the Realtek DriverKit serial path that this machine depends on.
+Recorded so the mistake is not repeated:
+
+1. **The two read paths were treated as two views of the same data.** They are
+   two vnodes with two page-cache entries. Only one of them is patched. The
+   difference was read as "the boot snapshot is corrupt".
+2. **`purge` was thought to be ineffective** because the bad bytes came back
+   after purging. They came back because bluetoothd was still running and
+   re-patched the page. The decisive test — stop the daemon, *then* purge — was
+   not run until later.
+3. **"The corruption changes between boots" was over-interpreted.** Different
+   boots ran different amounts of bluetoothd, so different pages had been
+   patched; that was mistaken for drifting media damage.
+4. **`mount_apfs -s <name>` silently falls back to the live volume** when the
+   snapshot name does not resolve, so every "the snapshot is fine" check was
+   actually hashing the live volume. Do not trust snapshot hashes obtained that
+   way; the only trustworthy observation is what the booted root reports.
+
+The general lesson: before concluding "the storage is corrupt", toggle the
+process that touches the file and re-hash. If the bytes follow the process, the
+process is the author.
